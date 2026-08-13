@@ -112,19 +112,29 @@ where
 
 #[cfg(feature = "sqlite")]
 pub fn spawn_sqlite_storage_actor(path: std::path::PathBuf) -> Result<StorageHandle, StorageError> {
+    spawn_sqlite_storage_actor_with_options(path, super::SqliteStorageOptions::default())
+}
+
+#[cfg(feature = "sqlite")]
+pub fn spawn_sqlite_storage_actor_with_options(
+    path: std::path::PathBuf,
+    options: super::SqliteStorageOptions,
+) -> Result<StorageHandle, StorageError> {
     let (sender, receiver) = mpsc::channel::<StorageOperation>();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
         .name("lxmf-sqlite-storage".into())
-        .spawn(move || match super::SqliteStorage::open(&path) {
-            Ok(storage) => {
-                let _ = ready_tx.send(Ok(()));
-                run_worker(Box::new(storage), receiver);
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error));
-            }
-        })
+        .spawn(
+            move || match super::SqliteStorage::open_with_options(&path, options) {
+                Ok(storage) => {
+                    let _ = ready_tx.send(Ok(()));
+                    run_worker(Box::new(storage), receiver);
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                }
+            },
+        )
         .map_err(StorageError::Io)?;
     ready_rx
         .recv()

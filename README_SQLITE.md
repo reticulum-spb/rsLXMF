@@ -21,10 +21,10 @@ SQLite может быть единственным форматом долго�
 Импорт существующих `.lxm`-файлов и snapshot-файлов также не требуется:
 SQLite-хранилище при первом запуске создаётся с чистого листа.
 
-## Текущее состояние
+## Исходное состояние до миграции
 
-Сейчас значительная часть состояния загружается и постоянно удерживается в
-памяти:
+До миграции значительная часть состояния загружалась и постоянно удерживалась
+в памяти:
 
 - индекс сообщений `PropagationStore`;
 - `locally_delivered_ids` и `locally_processed_ids`;
@@ -38,11 +38,11 @@ SQLite-хранилище при первом запуске создаётся 
 180 дней. На постоянно работающем узле это приводит к длительному накоплению
 записей даже при умеренном трафике.
 
-Тела propagation-сообщений сейчас находятся в отдельных файлах, а их метаданные
-дублируются в памяти. После миграции и метаданные, и payload должны храниться
-в одной записи базы. Сохранять параллельные `.lxm`-файлы не требуется.
+Тела propagation-сообщений находились в отдельных файлах, а их метаданные
+дублировались в памяти. Теперь метаданные и payload хранятся в одной записи
+базы; параллельные `.lxm`-файлы production daemon не создаёт.
 
-## Предлагаемая архитектура
+## Реализованная архитектура
 
 SQLite становится источником истины для долговременного состояния. В памяти
 остаются только:
@@ -91,11 +91,12 @@ actor. Не следует открывать соединение на кажд
 допускается отдельный blocking worker. Обычные точечные операции могут
 последовательно выполняться владельцем хранилища.
 
-## Предварительная схема базы
+## Схема базы
 
-Имена и состав столбцов могут уточняться в ходе реализации. Все хеши следует
-хранить как BLOB фиксированной длины, а timestamps — как целые Unix seconds,
-если протокольная совместимость не требует дробной части.
+Текущая версия схемы — 7. Версия хранится в `schema_meta`; более новая
+неизвестная версия отклоняется при открытии. Хеши хранятся как BLOB с проверкой
+длины, timestamps — как Unix time. Ниже показаны основные таблицы сообщений;
+полная схема создаётся последовательными migrations в SQLite backend.
 
 ```sql
 CREATE TABLE schema_meta (
@@ -132,23 +133,29 @@ CREATE INDEX transient_ids_seen_at
     ON transient_ids(seen_at);
 
 CREATE TABLE outbound_messages (
-    message_id            BLOB PRIMARY KEY,
+    message_id            BLOB PRIMARY KEY CHECK(length(message_id) = 32),
     destination_hash      BLOB NOT NULL CHECK(length(destination_hash) = 16),
     state                 INTEGER NOT NULL,
     delivery_method       INTEGER NOT NULL,
-    next_delivery_attempt INTEGER NOT NULL,
+    deferred              INTEGER NOT NULL,
+    next_delivery_attempt REAL NOT NULL,
+    last_delivery_attempt REAL NOT NULL,
     delivery_attempts     INTEGER NOT NULL,
-    created_at            INTEGER NOT NULL,
+    created_at            REAL NOT NULL,
+    progress              REAL NOT NULL,
     encoded_message       BLOB NOT NULL
 ) WITHOUT ROWID;
 
 CREATE INDEX outbound_ready
     ON outbound_messages(state, next_delivery_attempt);
+
+CREATE INDEX outbound_deferred_ready
+    ON outbound_messages(deferred, next_delivery_attempt);
 ```
 
 В этой же базе хранятся:
 
-- `known_identities`;
+- `identities`;
 - `received_ratchets`;
 - `tickets`;
 - `stamp_costs`;
@@ -156,7 +163,7 @@ CREATE INDEX outbound_ready
 - delivery ratchet ring и подписанный announce control state в `state_blobs`;
 - принятые сообщения в `inbound_messages`.
 
-`known_identities` и `received_ratchets` также должны быть перенесены в SQLite:
+`identities` и `received_ratchets` также перенесены в SQLite:
 малое количество записей на тестовом запуске было следствием предварительной
 очистки каталога и не отражает долговременный production-объём. На сетевом пути
 следует использовать ограниченный cache, не загружая таблицы целиком. Активное
@@ -214,22 +221,22 @@ incremental BLOB I/O пока не требуется. К этому решен�
 ## Настройки SQLite
 
 База рассчитана на небольшой одноплатный компьютер и, вероятно, SD-карту.
-Предварительные настройки:
+Фактически применяемые настройки:
 
 ```sql
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA temp_store=FILE;
-PRAGMA cache_size=-1024;
+PRAGMA cache_size=-<page_cache_size>;
 PRAGMA mmap_size=0;
 PRAGMA wal_autocheckpoint=128;
 PRAGMA busy_timeout=5000;
 PRAGMA auto_vacuum=INCREMENTAL;
 ```
 
-Значения должны быть проверены на целевой системе. Нельзя полагаться на
-настройки SQLite по умолчанию, поскольку page cache и memory mapping могут
-свести на нет часть экономии RAM.
+`page_cache_size` задаётся в конфигурации в КиБ и по умолчанию равен 1024.
+Journal mode после открытия проверяется. Эти значения всё ещё необходимо
+проверить измерениями RSS и I/O на целевой системе.
 
 Записи с высокой частотой следует группировать в короткие транзакции. Нельзя
 выполнять отдельный синхронный commit для каждого принятого пакета или transient
@@ -238,6 +245,23 @@ ID: это снижает производительность и ускоряе
 Полный `VACUUM` не должен запускаться автоматически. Для возврата свободных
 страниц следует использовать редкий `incremental_vacuum` и контролируемые WAL
 checkpoints.
+
+### Backup, restore и выключение
+
+Перед копированием базы daemon следует штатно остановить. При штатной остановке
+storage worker завершает принятые операции; периодический PASSIVE checkpoint
+не является гарантией пустого WAL. Для согласованной online-копии нужно
+использовать SQLite backup API или команду `.backup`, а не копировать только
+основной файл работающей базы. Для offline backup после остановки следует
+сохранить `lxmf.sqlite` вместе с существующими `lxmf.sqlite-wal` и
+`lxmf.sqlite-shm` либо предварительно выполнить checkpoint штатным SQLite
+инструментом.
+
+Для восстановления daemon должен быть остановлен. Нужно заменить согласованный
+комплект файлов базы и сохранить права доступа владельца; на Unix daemon
+устанавливает режим `0600`. Identity находится вне `storage` и в backup базы не
+входит. Удаление каталога `storage` означает намеренный запуск с пустым durable
+state; импорт старых файловых форматов не выполняется.
 
 ## Надёжность и ограничения размера
 
@@ -259,9 +283,9 @@ Weighted culling можно выполнять пакетами. SQL выбир�
 payload, Rust вычисляет или уточняет вес, после чего выбранные строки удаляются
 одной транзакцией.
 
-## Наблюдаемость
+## Наблюдаемость и измерения
 
-До и во время миграции нужны периодические диагностические метрики:
+Для проверки результата миграции полезны периодические диагностические метрики:
 
 - RSS и high-water mark процесса;
 - количество и суммарный payload `pending_outbound`;
@@ -289,13 +313,18 @@ incremental vacuum (не менее 60 секунд), а `vacuum_pages` огра
 создаётся daemon’ом. Перенос уже существующей базы при смене параметра
 автоматически не выполняется.
 
+`[storage] page_cache_size` задаёт бюджет SQLite page cache в КиБ через
+отрицательное значение `PRAGMA cache_size`. Значение ограничивается диапазоном
+64–65536 КиБ; по умолчанию используется 1024 КиБ. Это верхняя целевая величина
+кэша SQLite, а не жёсткий лимит RSS всего процесса.
+
 Существующий `[propagation] message_storage_limit` используется также как
 физический бюджет DB+WAL. При превышении удаляются только propagation messages
 по существующей weighted policy; outbound, inbound, identities, tickets и
 crypto state автоматически не удаляются. Если база без propagation payload
 сама превышает лимит, daemon сообщает об этом, но сохраняет durable state.
 
-## Порядок миграции
+## Этапы реализации
 
 1. Добавить метрики и подтвердить источники роста.
 2. Ввести внутреннюю абстракцию хранилища.

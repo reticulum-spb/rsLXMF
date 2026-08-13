@@ -520,7 +520,11 @@ impl LxmdRunner {
         std::fs::create_dir_all(database_parent)?;
         let (mut router, storage) =
             create_router_with_sqlite(&config, transport_tx.clone(), &database_path)?;
-        tracing::info!(path = %database_path.display(), "SQLite storage opened");
+        tracing::info!(
+            path = %database_path.display(),
+            page_cache_kib = config.page_cache_size,
+            "SQLite storage opened"
+        );
         let persisted_peers = router.load_persisted_peers();
         tracing::info!(persisted_peers, "Propagation peers loaded from SQLite");
 
@@ -1625,6 +1629,7 @@ impl LxmdRunner {
                             checkpointed_frames = stats.checkpointed_frames,
                             remaining_wal_frames = stats.remaining_wal_frames,
                             vacuumed_pages = stats.vacuumed_pages,
+                            page_cache_kib = stats.page_cache_kib,
                             duration_ms = started.elapsed().as_millis(),
                             "SQLite maintenance completed"
                         )

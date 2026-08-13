@@ -210,6 +210,9 @@ auth_required = no
 # Absolute path, or a path relative to the LXMF config directory.
 # database_path = storage/lxmf/lxmf.sqlite
 
+# SQLite page cache budget in KiB (clamped to 64..65536).
+page_cache_size = 1024
+
 # SQLite maintenance period in seconds (minimum 60) and maximum pages reclaimed per pass.
 vacuum_interval = 3600
 vacuum_pages = 128

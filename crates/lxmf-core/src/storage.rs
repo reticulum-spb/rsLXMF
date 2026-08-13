@@ -146,6 +146,7 @@ pub struct StorageMaintenance {
     pub checkpointed_frames: u64,
     pub remaining_wal_frames: u64,
     pub vacuumed_pages: u64,
+    pub page_cache_kib: u64,
 }
 
 /// Synchronous because the router/storage actor owns each implementation.
@@ -776,10 +777,10 @@ mod sqlite;
 pub use actor::{StorageHandle, spawn_storage_actor};
 
 #[cfg(feature = "sqlite")]
-pub use actor::spawn_sqlite_storage_actor;
+pub use actor::{spawn_sqlite_storage_actor, spawn_sqlite_storage_actor_with_options};
 
 #[cfg(feature = "sqlite")]
-pub use sqlite::SqliteStorage;
+pub use sqlite::{SqliteStorage, SqliteStorageOptions};
 
 #[cfg(feature = "sqlite")]
 pub fn open_sqlite(path: &Path) -> Result<SqliteStorage, StorageError> {

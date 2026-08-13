@@ -11,6 +11,19 @@ use crate::types::PropagationTransientId;
 
 const SCHEMA_VERSION: u32 = 7;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteStorageOptions {
+    pub page_cache_kib: u32,
+}
+
+impl Default for SqliteStorageOptions {
+    fn default() -> Self {
+        Self {
+            page_cache_kib: 1024,
+        }
+    }
+}
+
 pub struct SqliteStorage {
     connection: Connection,
     path: PathBuf,
@@ -18,6 +31,13 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        Self::open_with_options(path, SqliteStorageOptions::default())
+    }
+
+    pub fn open_with_options(
+        path: &Path,
+        options: SqliteStorageOptions,
+    ) -> Result<Self, StorageError> {
         let mut connection = Connection::open(path).map_err(database_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -28,10 +48,12 @@ impl SqliteStorage {
                  PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=NORMAL;
                  PRAGMA temp_store=FILE;
-                 PRAGMA cache_size=-1024;
                  PRAGMA mmap_size=0;
                  PRAGMA wal_autocheckpoint=128;",
             )
+            .map_err(database_error)?;
+        connection
+            .pragma_update(None, "cache_size", -i64::from(options.page_cache_kib))
             .map_err(database_error)?;
         secure_database_files(path)?;
         migrate(&mut connection)?;
@@ -742,6 +764,7 @@ impl LxmfStorage for SqliteStorage {
                 wal_frames
             },
             vacuumed_pages: free_before.saturating_sub(free_after),
+            page_cache_kib: pragma_u64_abs(&self.connection, "cache_size")?,
         })
     }
 }
@@ -749,6 +772,13 @@ impl LxmfStorage for SqliteStorage {
 fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, StorageError> {
     connection
         .query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, u64>(0))
+        .map_err(database_error)
+}
+
+fn pragma_u64_abs(connection: &Connection, name: &str) -> Result<u64, StorageError> {
+    connection
+        .query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))
+        .map(|value| value.unsigned_abs())
         .map_err(database_error)
 }
 
@@ -1203,6 +1233,23 @@ mod tests {
         assert_eq!(integer("wal_autocheckpoint"), 128);
         assert_eq!(integer("busy_timeout"), 5000);
         assert_eq!(integer("auto_vacuum"), 2);
+    }
+
+    #[test]
+    fn applies_configured_page_cache_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open_with_options(
+            &directory.path().join("cache.sqlite"),
+            SqliteStorageOptions {
+                page_cache_kib: 256,
+            },
+        )
+        .unwrap();
+        let cache_size = storage
+            .connection
+            .pragma_query_value(None, "cache_size", |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(cache_size, -256);
     }
 
     #[test]

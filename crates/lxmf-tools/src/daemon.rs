@@ -4,7 +4,9 @@
 
 use lxmf_core::constants::*;
 use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
-use lxmf_core::storage::{StorageError, StorageHandle, spawn_sqlite_storage_actor};
+use lxmf_core::storage::{
+    SqliteStorageOptions, StorageError, StorageHandle, spawn_sqlite_storage_actor_with_options,
+};
 use rns_runtime::config::{Config, ConfigSection};
 use std::path::PathBuf;
 
@@ -167,6 +169,8 @@ pub struct DaemonConfig {
     pub message_storage_limit: Option<usize>,
     /// Optional SQLite path; relative values are resolved from the LXMF config directory.
     pub database_path: Option<PathBuf>,
+    /// SQLite page cache budget in KiB (`PRAGMA cache_size=-N`).
+    pub page_cache_size: u32,
     /// Period between passive WAL checkpoint / incremental vacuum passes.
     pub vacuum_interval: u64,
     /// Maximum freelist pages reclaimed in one maintenance pass.
@@ -206,6 +210,7 @@ impl Default for DaemonConfig {
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
             database_path: None,
+            page_cache_size: 1024,
             vacuum_interval: 3600,
             vacuum_pages: 128,
             from_static_only: false,
@@ -321,6 +326,9 @@ impl DaemonConfig {
             if let Some(interval) = sec.get_uint("vacuum_interval") {
                 dc.vacuum_interval = interval.max(60);
             }
+            if let Some(size) = sec.get_uint("page_cache_size") {
+                dc.page_cache_size = size.clamp(64, 65_536) as u32;
+            }
             if let Some(pages) = sec.get_uint("vacuum_pages") {
                 dc.vacuum_pages = pages.min(u32::MAX as u64) as u32;
             }
@@ -384,7 +392,12 @@ pub fn create_router_with_sqlite(
     transport_tx: tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>,
     database_path: &std::path::Path,
 ) -> Result<(LxmRouter, StorageHandle), StorageError> {
-    let storage = spawn_sqlite_storage_actor(database_path.to_path_buf())?;
+    let storage = spawn_sqlite_storage_actor_with_options(
+        database_path.to_path_buf(),
+        SqliteStorageOptions {
+            page_cache_kib: config.page_cache_size,
+        },
+    )?;
     let mut router =
         LxmRouter::with_shared_storage_backend(config.to_router_config(), storage.clone());
     router.set_transport(transport_tx);
@@ -705,7 +718,7 @@ propagation_stamp_cost = 19
     #[test]
     fn storage_maintenance_config_is_bounded() {
         let config = Config::parse(
-            "[storage]\ndatabase_path = data/custom.sqlite\nvacuum_interval = 1\nvacuum_pages = 42\n",
+            "[storage]\ndatabase_path = data/custom.sqlite\npage_cache_size = 32\nvacuum_interval = 1\nvacuum_pages = 42\n",
         )
         .unwrap();
         let parsed = DaemonConfig::from_config(&config);
@@ -715,6 +728,7 @@ propagation_stamp_cost = 19
         );
         assert_eq!(parsed.vacuum_interval, 60);
         assert_eq!(parsed.vacuum_pages, 42);
+        assert_eq!(parsed.page_cache_size, 64);
     }
 
     /// Python lxmd exposes no enforce_ratchets option; the key must parse as a no-op.
