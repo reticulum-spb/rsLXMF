@@ -80,14 +80,14 @@
 - [x] Перевести `lxmf-tools` на новые high-level methods.
 - [x] Перевести control handlers на status/query DTO.
 - [x] Перевести peer management и sync scheduling на router methods.
-- [ ] Перевести сохранение tickets/stamp costs/transient IDs на storage API.
+- [x] Перевести сохранение tickets/stamp costs/transient IDs на storage API.
 - [x] Перевести daemon tests на high-level API.
 - [x] Убедиться, что production-код `lxmf-tools` больше не обращается напрямую
   к storage-sensitive полям `LxmRouter`.
 - [x] Добавить проверку/тест, запрещающий новые прямые обращения к этим полям.
 - [x] Сохранить старые публичные поля на переходный период для source
   compatibility, но перестать использовать их как источник истины.
-- [ ] Пометить representation-leaking поля deprecated после перевода всех
+- [x] Пометить representation-leaking поля deprecated после перевода всех
   внутренних consumers.
 - [x] Проверить неизменность daemon CLI и control protocol.
 - [ ] Выполнить regression tests `lxmf-core`, `lxmf-tools` и examples.
@@ -106,8 +106,8 @@
   - [x] transient ID operations;
   - [x] propagation metadata operations;
   - [x] propagation payload operations;
-  - [ ] outbound queue operations;
-  - [ ] identity/ratchet/ticket/stamp-cost operations.
+  - [x] outbound queue operations;
+  - [x] identity/ratchet/ticket/stamp-cost operations.
 - [ ] Для каждой группы определить point, bounded-page и batch operations.
 - [x] Не добавлять в storage trait методы, возвращающие `&T`, `&mut T`,
   `&HashMap` или `&[T]`.
@@ -128,8 +128,10 @@
   - [ ] `LxmRouter`/`PropagationNode` actor;
   - [x] отдельный blocking storage worker с клонируемым handle.
 - [x] Исключить выполнение SQL-операций на Tokio executor thread.
-- [ ] Добавить mock/failure injection для storage errors.
-- [ ] Определить fail-open/fail-closed поведение для каждой операции.
+- [x] Добавить детерминированный failure injection на storage actor handle для
+  проверки ошибок без остановки worker или подмены backend.
+- [x] Определить fail-open/fail-closed поведение по классам операций и
+  задокументировать необратимые события, cache/derived state и maintenance.
 - [x] Добавить contract tests, одинаковые для `MemoryStorage` и
   `SqliteStorage`.
 
@@ -211,8 +213,9 @@
 - [x] Не запускать orphan-file cleanup в SQLite backend.
 - [x] Одноразовую миграцию существующих файлов не реализовывать: SQLite
   storage всегда создаётся с чистого листа.
-- [ ] После переходного периода удалить устаревшие persistence-функции.
-- [ ] Обновить конфигурацию и документацию путей хранения.
+- [x] Удалить устаревшие router persistence-функции; файловый backend
+  `PropagationNode` оставить deprecated только для публичной API-совместимости.
+- [x] Обновить конфигурацию и документацию путей хранения.
 
 ## 8. Outbound и deferred messages
 
@@ -289,13 +292,13 @@
 
 ## 12. Документация и завершение
 
-- [ ] Описать новый путь и формат базы.
+- [x] Описать новый путь и формат базы.
 - [ ] Описать параметры ограничения памяти и page cache.
 - [ ] Описать backup/restore SQLite database.
 - [ ] Описать безопасное выключение и checkpoint.
 - [ ] Описать последствия удаления старой Python/file-format совместимости.
 - [ ] Обновить основной README после стабилизации backend.
-- [ ] Удалить неиспользуемый код старого persistence.
+- [x] Удалить неиспользуемый код старого router persistence.
 - [ ] Удалить переходные feature flags, если они больше не нужны.
 - [ ] Провести финальный аудит публичного API.
 - [ ] Зафиксировать результаты измерений на OrangePi 256 МБ и 512 МБ.

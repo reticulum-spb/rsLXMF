@@ -1273,12 +1273,8 @@ impl LxmdRunner {
                     attempts = message.delivery_attempts,
                     "link delivery failed"
                 );
-                let router_owned = msg_hash.is_some_and(|hash| {
-                    self.router
-                        .pending_outbound
-                        .iter()
-                        .any(|pending| pending.hash == Some(hash))
-                });
+                let router_owned =
+                    msg_hash.is_some_and(|hash| self.router.has_pending_outbound(&hash));
                 if link_failure_retryable(&reason)
                     && message.delivery_attempts <= MAX_DELIVERY_ATTEMPTS
                 {
@@ -1403,8 +1399,8 @@ impl LxmdRunner {
         // only — avoids cloning route_hops/known_identities every tick.
         let direct_inputs = self
             .router
-            .pending_outbound
-            .iter()
+            .outbound_summaries(1)
+            .into_iter()
             .filter(|message| message.method == DeliveryMethod::Direct)
             .map(|message| message.destination_hash)
             .collect::<HashSet<_>>()

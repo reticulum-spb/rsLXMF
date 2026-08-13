@@ -25,13 +25,15 @@
 //! | [`link_delivery`]     | Reticulum-link-based delivery path                 |
 //! | [`handlers`]          | Callback trait surface for delivery events         |
 //! | [`ticket`]            | Small typed identifier for propagation workflows   |
-//! | [`persist`]           | MessagePack-based on-disk state                    |
+//! | [`persist`]           | Atomic output for explicit message export         |
 //! | [`constants`]         | Wire constants: STATE, METHOD, field IDs, etc.     |
 //!
 //! See also `crates/lxmf-tools/` for the `lxmd-rs` binary, and `rsReticulum`
 //! (sibling repo) for the Reticulum protocol stack itself.
 //!
 //! [`DiscoveryStamper`]: rns_transport::discovery::DiscoveryStamper
+
+#![allow(deprecated)]
 
 /// Unix time as f64 seconds — Python `time.time()` equivalent.
 pub(crate) fn now_f64() -> f64 {

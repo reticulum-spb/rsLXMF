@@ -259,6 +259,7 @@ impl PropagationNode {
     }
 
     /// Disk-backed node. Loads existing messages from `storage_path` on startup.
+    #[deprecated(note = "use with_storage_backend or with_shared_storage_backend")]
     pub fn with_storage(
         config: PropagationNodeConfig,
         dest_hash: [u8; 16],

@@ -264,8 +264,10 @@ pub struct LxmRouter {
     storage_authoritative: bool,
     outbound_callbacks: HashMap<[u8; 32], MessageCallbacks>,
     pub config: RouterConfig,
+    #[deprecated(note = "use bounded outbound query and command methods")]
     pub pending_outbound: Vec<LxMessage>,
     /// Messages awaiting deferred stamp generation, keyed by message hash.
+    #[deprecated(note = "use deferred-stamp query and command methods")]
     pub pending_deferred_stamps: HashMap<[u8; 32], LxMessage>,
     /// Captured at construction (or via [`set_runtime_handle`](Self::set_runtime_handle))
     /// so deferred-stamp PoW can spawn onto the blocking pool even when the
@@ -279,18 +281,23 @@ pub struct LxmRouter {
     pub blocked: Vec<[u8; 16]>,
     pub allowed_control: Vec<[u8; 16]>,
     pub ignored: Vec<[u8; 16]>,
+    #[deprecated(note = "use peer summaries and peer command methods")]
     pub peers: HashMap<[u8; 16], LxmPeer>,
     /// Peers that will never be rotated out.
     pub static_peers: Vec<[u8; 16]>,
+    #[deprecated(note = "use propagation metadata/payload query methods")]
     pub propagation_store: PropagationStore,
     /// Cached stamp costs keyed by destination hash.
+    #[deprecated(note = "use stamp-cost storage-backed methods")]
     pub outbound_stamp_costs: HashMap<[u8; 16], StampCostEntry>,
+    #[deprecated(note = "use ticket storage-backed methods")]
     pub ticket_store: TicketStore,
     /// Identity hash → priority level.
     pub prioritized: HashMap<[u8; 16], u8>,
     pub delivery_callback: Option<DeliveryCallback>,
     pub transport_tx: Option<mpsc::Sender<rns_transport::messages::TransportMessage>>,
     /// Throttled peers → expiry timestamp (seconds since UNIX epoch).
+    #[deprecated(note = "use throttle command and status methods")]
     pub throttled_peers: HashMap<[u8; 16], f64>,
     pub propagation_start_time: Option<f64>,
     pub processing_count: u64,
@@ -737,6 +744,14 @@ impl LxmRouter {
                 progress: message.progress,
             })
             .collect()
+    }
+
+    /// Point lookup used to decide whether a link-delivery result is still
+    /// owned by this router without exposing the compatibility queue.
+    pub fn has_pending_outbound(&self, message_id: &[u8; 32]) -> bool {
+        self.pending_outbound.iter().any(|message| {
+            message.message_id == Some(*message_id) || message.hash == Some(*message_id)
+        })
     }
 
     /// Query one deferred-stamp message without exposing the backing map.
@@ -1520,37 +1535,6 @@ impl LxmRouter {
         };
         callback(message);
         true
-    }
-
-    /// Load legacy persisted stamp costs and tickets from `state_dir`.
-    /// Transient IDs are exclusively owned by [`LxmfStorage`].
-    pub fn load_state(&mut self, state_dir: &std::path::Path) -> std::io::Result<()> {
-        if self.storage_authoritative {
-            return Ok(());
-        }
-        use crate::persist;
-        self.outbound_stamp_costs = persist::load_stamp_costs(state_dir)?;
-        self.ticket_store
-            .replace_all(persist::load_tickets(state_dir)?);
-        // Python cleans tickets and stamp costs at load (LXMRouter.py:258-284).
-        let now = now_f64();
-        self.ticket_store.cull(now);
-        self.outbound_stamp_costs
-            .retain(|_, e| now - e.recorded_at < STAMP_COST_EXPIRY as f64);
-        Ok(())
-    }
-
-    /// Persist runtime state to `state_dir` using MessagePack. Safe to call
-    /// periodically; each file is written atomically via rename.
-    pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
-        if self.storage_authoritative {
-            return Ok(());
-        }
-        use crate::persist;
-
-        persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
-        persist::save_tickets(state_dir, self.ticket_store.all())?;
-        Ok(())
     }
 
     /// Return peer destination hashes that are due for sync and mark each as
@@ -3554,33 +3538,6 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.title, "paper");
         assert!(fired.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_save_and_load_state_roundtrip() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dest_a = [0xAA; 16];
-        let mut r1 = LxmRouter::new(RouterConfig::default());
-        r1.set_stamp_cost(dest_a, 8);
-        // Far-future expiry so get_outbound_ticket (which uses wall-clock now) matches.
-        r1.remember_ticket(dest_a, [0x01; 16], 4_102_444_800.0);
-        r1.save_state(tmp.path()).unwrap();
-
-        let mut r2 = LxmRouter::new(RouterConfig::default());
-        r2.load_state(tmp.path()).unwrap();
-        assert_eq!(
-            r2.outbound_stamp_costs.get(&dest_a).map(|e| e.cost),
-            Some(8)
-        );
-        assert_eq!(r2.get_outbound_ticket(&dest_a), Some([0x01; 16]));
-    }
-
-    #[test]
-    fn test_load_state_missing_dir_is_ok() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut r = LxmRouter::new(RouterConfig::default());
-        r.load_state(tmp.path()).unwrap();
-        assert!(r.outbound_stamp_costs.is_empty());
     }
 
     #[test]

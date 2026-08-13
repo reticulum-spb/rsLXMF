@@ -236,6 +236,12 @@ the handler is started. A non-zero handler exit status is logged.
 `lxmd-rs --config <dir>` expects a directory and reads `<dir>/config`.
 `lxmd-rs --rnsconfig <dir>` expects a Reticulum config directory.
 
+The daemon keeps all durable runtime state in
+`<config-dir>/storage/lxmf/lxmf.sqlite`. It does not create parallel message,
+ratchet, ticket, stamp-cost or router-state files. The identity remains at
+`<config-dir>/identity`; deleting `storage` starts with an empty database and
+does not replace that identity.
+
 If no LXMF config directory is supplied, the default is:
 
 | Platform | Default LXMF config file |

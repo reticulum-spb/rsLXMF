@@ -77,11 +77,6 @@ impl TicketStore {
     pub fn all(&self) -> &[Ticket] {
         &self.tickets
     }
-
-    /// Replace the entire ticket set — used when restoring from persisted state.
-    pub fn replace_all(&mut self, tickets: Vec<Ticket>) {
-        self.tickets = tickets;
-    }
 }
 
 #[cfg(test)]

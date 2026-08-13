@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::{
@@ -26,6 +28,8 @@ impl std::fmt::Debug for StorageHandle {
 struct ActorInner {
     sender: Mutex<Option<mpsc::Sender<StorageOperation>>>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    injected_failures: AtomicUsize,
 }
 
 impl ActorInner {
@@ -33,6 +37,8 @@ impl ActorInner {
         Self {
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(Some(worker)),
+            #[cfg(test)]
+            injected_failures: AtomicUsize::new(0),
         }
     }
 }
@@ -52,6 +58,17 @@ impl StorageHandle {
         T: Send + 'static,
         F: FnOnce(&mut dyn LxmfStorage) -> Result<T, StorageError> + Send + 'static,
     {
+        #[cfg(test)]
+        if self
+            .inner
+            .injected_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(StorageError::ActorUnavailable);
+        }
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let sender = self
             .inner
@@ -69,6 +86,13 @@ impl StorageHandle {
         reply_rx
             .recv()
             .map_err(|_| StorageError::ActorUnavailable)?
+    }
+
+    /// Inject deterministic operation failures in tests without changing the
+    /// wrapped backend or killing its worker.
+    #[cfg(test)]
+    pub(crate) fn fail_next_operations(&self, count: usize) {
+        self.inner.injected_failures.store(count, Ordering::SeqCst);
     }
 }
 
@@ -426,5 +450,27 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(first.message_store_stats().unwrap().count, 1);
+    }
+
+    #[test]
+    fn injected_failure_is_counted_and_backend_recovers() {
+        let mut storage = spawn_storage_actor(MemoryStorage::new()).unwrap();
+        storage.fail_next_operations(2);
+        assert!(matches!(
+            storage.stamp_cost_count(),
+            Err(StorageError::ActorUnavailable)
+        ));
+        assert!(matches!(
+            storage.stamp_cost_count(),
+            Err(StorageError::ActorUnavailable)
+        ));
+        storage
+            .upsert_transient_id(TransientIdKind::LocallyDelivered, [7; 32], 10)
+            .unwrap();
+        assert!(
+            storage
+                .contains_transient_id(TransientIdKind::LocallyDelivered, &[7; 32])
+                .unwrap()
+        );
     }
 }

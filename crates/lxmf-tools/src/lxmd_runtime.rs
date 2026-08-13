@@ -12,21 +12,9 @@ pub struct LxmdPaths {
     pub config_dir: PathBuf,
     pub identity_path: PathBuf,
     pub storage_dir: PathBuf,
-    pub messages_dir: PathBuf,
     pub lxmf_storage_dir: PathBuf,
     pub database_path: PathBuf,
-    pub router_state_dir: PathBuf,
-    pub propagation_store_dir: PathBuf,
-    pub ratchets_dir: PathBuf,
-    pub ratchet_ring_path: PathBuf,
-    pub ratchet_control_path: PathBuf,
-    pub received_ratchets_dir: PathBuf,
-    pub known_identities_path: PathBuf,
-    pub legacy_lxmf_dir: PathBuf,
     pub legacy_identity_path: PathBuf,
-    pub legacy_messages_dir: PathBuf,
-    pub legacy_ratchets_dir: PathBuf,
-    pub legacy_propagation_store_dir: PathBuf,
 }
 
 impl LxmdPaths {
@@ -34,42 +22,18 @@ impl LxmdPaths {
         let config_dir = config_dir.into();
         let identity_path = config_dir.join("identity");
         let storage_dir = config_dir.join("storage");
-        let messages_dir = storage_dir.join("messages");
         let lxmf_storage_dir = storage_dir.join("lxmf");
         let database_path = lxmf_storage_dir.join("lxmf.sqlite");
-        let router_state_dir = lxmf_storage_dir.clone();
-        let propagation_store_dir = lxmf_storage_dir.join("messagestore");
-        let ratchets_dir = lxmf_storage_dir.join("ratchets");
-        let ratchet_ring_path = ratchets_dir.join("ring");
-        let ratchet_control_path = ratchets_dir.join("ring.control");
-        let received_ratchets_dir = ratchets_dir.join("received");
-        let known_identities_path = ratchets_dir.join("known_identities");
 
-        let legacy_lxmf_dir = config_dir.join(".lxmf");
-        let legacy_identity_path = legacy_lxmf_dir.join("identity");
-        let legacy_messages_dir = legacy_lxmf_dir.join("messages");
-        let legacy_ratchets_dir = legacy_lxmf_dir.join("ratchets");
-        let legacy_propagation_store_dir = legacy_lxmf_dir.join("propagation");
+        let legacy_identity_path = config_dir.join(".lxmf/identity");
 
         Self {
             config_dir,
             identity_path,
             storage_dir,
-            messages_dir,
             lxmf_storage_dir,
             database_path,
-            router_state_dir,
-            propagation_store_dir,
-            ratchets_dir,
-            ratchet_ring_path,
-            ratchet_control_path,
-            received_ratchets_dir,
-            known_identities_path,
-            legacy_lxmf_dir,
             legacy_identity_path,
-            legacy_messages_dir,
-            legacy_ratchets_dir,
-            legacy_propagation_store_dir,
         }
     }
 
@@ -305,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn lxmd_paths_match_python_storage_layout() {
+    fn lxmd_paths_expose_only_active_sqlite_storage_layout() {
         let config = PathBuf::from("/tmp/lxmd-config");
         let paths = LxmdPaths::new(&config);
 
@@ -316,66 +280,12 @@ mod tests {
         );
         assert_eq!(paths.storage_dir, PathBuf::from("/tmp/lxmd-config/storage"));
         assert_eq!(
-            paths.messages_dir,
-            PathBuf::from("/tmp/lxmd-config/storage/messages")
-        );
-        assert_eq!(
             paths.lxmf_storage_dir,
             PathBuf::from("/tmp/lxmd-config/storage/lxmf")
         );
         assert_eq!(
-            paths.router_state_dir,
-            PathBuf::from("/tmp/lxmd-config/storage/lxmf")
-        );
-        assert_eq!(
-            paths.propagation_store_dir,
-            PathBuf::from("/tmp/lxmd-config/storage/lxmf/messagestore")
-        );
-        assert_eq!(
-            paths.ratchets_dir,
-            PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets")
-        );
-        assert_eq!(
-            paths.ratchet_ring_path,
-            PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/ring")
-        );
-        assert_eq!(
-            paths.ratchet_control_path,
-            PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/ring.control")
-        );
-        assert_eq!(
-            paths.received_ratchets_dir,
-            PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/received")
-        );
-        assert_eq!(
-            paths.known_identities_path,
-            PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/known_identities")
-        );
-    }
-
-    #[test]
-    fn lxmd_paths_expose_legacy_rust_layout() {
-        let paths = LxmdPaths::new("/tmp/lxmd-config");
-
-        assert_eq!(
-            paths.legacy_lxmf_dir,
-            PathBuf::from("/tmp/lxmd-config/.lxmf")
-        );
-        assert_eq!(
-            paths.legacy_identity_path,
-            PathBuf::from("/tmp/lxmd-config/.lxmf/identity")
-        );
-        assert_eq!(
-            paths.legacy_messages_dir,
-            PathBuf::from("/tmp/lxmd-config/.lxmf/messages")
-        );
-        assert_eq!(
-            paths.legacy_ratchets_dir,
-            PathBuf::from("/tmp/lxmd-config/.lxmf/ratchets")
-        );
-        assert_eq!(
-            paths.legacy_propagation_store_dir,
-            PathBuf::from("/tmp/lxmd-config/.lxmf/propagation")
+            paths.database_path,
+            PathBuf::from("/tmp/lxmd-config/storage/lxmf/lxmf.sqlite")
         );
     }
 
@@ -383,7 +293,7 @@ mod tests {
     fn preferred_identity_path_uses_python_identity_first() {
         let temp = unique_temp_dir("identity-python-first");
         let paths = LxmdPaths::new(&temp);
-        std::fs::create_dir_all(paths.legacy_lxmf_dir.clone()).unwrap();
+        std::fs::create_dir_all(paths.legacy_identity_path.parent().unwrap()).unwrap();
         std::fs::write(&paths.identity_path, b"python").unwrap();
         std::fs::write(&paths.legacy_identity_path, b"legacy").unwrap();
 
@@ -395,7 +305,7 @@ mod tests {
     fn preferred_identity_path_falls_back_to_legacy_identity() {
         let temp = unique_temp_dir("identity-legacy-fallback");
         let paths = LxmdPaths::new(&temp);
-        std::fs::create_dir_all(paths.legacy_lxmf_dir.clone()).unwrap();
+        std::fs::create_dir_all(paths.legacy_identity_path.parent().unwrap()).unwrap();
         std::fs::write(&paths.legacy_identity_path, b"legacy").unwrap();
 
         assert_eq!(paths.preferred_identity_path(), paths.legacy_identity_path);

@@ -54,6 +54,7 @@ impl PropagationSyncTask {
         ))))
     }
 
+    #[deprecated(note = "construct with a SQLite-backed shared PropagationNode")]
     pub fn with_storage(
         _transport_tx: mpsc::Sender<TransportMessage>,
         dest_hash: [u8; 16],

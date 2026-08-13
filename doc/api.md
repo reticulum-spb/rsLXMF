@@ -635,9 +635,10 @@ errors, status/peer representations и encrypted control behavior.
 - config directory resolution;
 - control preflight types/functions.
 
-`LxmdPaths` сейчас раскрывает каталоги отдельных message/ratchet/state files.
-При SQLite старые поля/paths следует временно сохранить, добавить
-`database_path`, а удаление legacy paths выполнять только в major release.
+`LxmdPaths` раскрывает активные пути конфигурации, identity и
+`storage/lxmf/lxmf.sqlite`, а также отдельный legacy fallback для identity.
+Поля путей message/ratchet/state files удалены: файловая совместимость storage
+не поддерживается, база всегда создаётся с чистого листа.
 
 ## Фактические потребители
 
