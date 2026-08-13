@@ -277,6 +277,24 @@ payload, Rust вычисляет или уточняет вес, после че
 Эти показатели нужны, чтобы отличить рост долговременного состояния от
 удержания буферов, незавершённых transfers или фрагментации allocator.
 
+`[storage] vacuum_interval` задаёт период PASSIVE WAL checkpoint и
+incremental vacuum (не менее 60 секунд), а `vacuum_pages` ограничивает число
+страниц за один проход. Maintenance выполняется storage worker’ом и
+откладывается при активной propagation sync-сессии. Полный `VACUUM`
+автоматически не запускается.
+
+`[storage] database_path` переопределяет стандартный путь
+`<config-dir>/storage/lxmf/lxmf.sqlite`. Абсолютное значение используется как
+есть; относительное разрешается от LXMF config directory. Родительский каталог
+создаётся daemon’ом. Перенос уже существующей базы при смене параметра
+автоматически не выполняется.
+
+Существующий `[propagation] message_storage_limit` используется также как
+физический бюджет DB+WAL. При превышении удаляются только propagation messages
+по существующей weighted policy; outbound, inbound, identities, tickets и
+crypto state автоматически не удаляются. Если база без propagation payload
+сама превышает лимит, daemon сообщает об этом, но сохраняет durable state.
+
 ## Порядок миграции
 
 1. Добавить метрики и подтвердить источники роста.

@@ -288,6 +288,13 @@ auth_required = no
 # propagation_stamp_cost_target = 16
 # propagation_stamp_cost_flexibility = 3
 
+[storage]
+# Absolute, or relative to the LXMF config directory:
+# database_path = storage/lxmf/lxmf.sqlite
+# Passive WAL checkpoint and bounded incremental vacuum.
+vacuum_interval = 3600
+vacuum_pages = 128
+
 [logging]
 loglevel = 4
 ```
@@ -298,6 +305,7 @@ Supported sections:
 | --- | --- |
 | `[lxmf]` | `display_name`, `announce_at_start`, `announce_interval`, `delivery_transfer_max_accepted_size`, `stamp_cost`, `on_inbound` |
 | `[propagation]` | `enable_node`, `node_name`, `auth_required`, `announce_at_start`, `announce_interval`, `autopeer`, `autopeer_maxdepth`, `message_storage_limit`, `propagation_message_max_accepted_size`, `propagation_sync_max_accepted_size`, `propagation_stamp_cost_target`, `propagation_stamp_cost_flexibility`, `peering_cost`, `remote_peering_cost_max`, `max_peers`, `static_peers`, `prioritise_destinations`, `control_allowed`, `from_static_only`, `outbound_node`, `propagation_stamp_cost`, `propagation_limit`, `enforce_stamps` |
+| `[storage]` | `database_path` (absolute or relative to the LXMF config directory), `vacuum_interval` (seconds, minimum 60), `vacuum_pages` (maximum pages reclaimed per pass) |
 | `[control]` | `auth_required`, `allowed` |
 | `[logging]` | `loglevel` |
 

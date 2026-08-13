@@ -1,11 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use super::{
-    LxmfStorage, MessageStoreStats, StorageError, StoredIdentity, StoredMessage,
-    StoredMessageMetadata, StoredOutboundMessage, StoredOutboundMetadata, StoredRatchet,
-    StoredStampCost, TransientIdKind, validate_message,
+    LxmfStorage, MessageStoreStats, StorageError, StorageMaintenance, StoredIdentity,
+    StoredMessage, StoredMessageMetadata, StoredOutboundMessage, StoredOutboundMetadata,
+    StoredRatchet, StoredStampCost, TransientIdKind, validate_message,
 };
 use crate::types::PropagationTransientId;
 
@@ -13,6 +13,7 @@ const SCHEMA_VERSION: u32 = 7;
 
 pub struct SqliteStorage {
     connection: Connection,
+    path: PathBuf,
 }
 
 impl SqliteStorage {
@@ -32,8 +33,13 @@ impl SqliteStorage {
                  PRAGMA wal_autocheckpoint=128;",
             )
             .map_err(database_error)?;
+        secure_database_files(path)?;
         migrate(&mut connection)?;
-        Ok(Self { connection })
+        secure_database_files(path)?;
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
     }
 
     pub fn schema_version(&self) -> Result<u32, StorageError> {
@@ -706,6 +712,71 @@ impl LxmfStorage for SqliteStorage {
         })
         .collect()
     }
+    fn maintain(&mut self, vacuum_pages: u32) -> Result<StorageMaintenance, StorageError> {
+        let page_size = pragma_u64(&self.connection, "page_size")?;
+        let page_count = pragma_u64(&self.connection, "page_count")?;
+        let free_before = pragma_u64(&self.connection, "freelist_count")?;
+        let (busy, wal_frames, checkpointed): (u64, u64, u64) = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(database_error)?;
+        let requested = u64::from(vacuum_pages).min(free_before);
+        if requested > 0 {
+            self.connection
+                .execute_batch(&format!("PRAGMA incremental_vacuum({requested})"))
+                .map_err(database_error)?;
+        }
+        let free_after = pragma_u64(&self.connection, "freelist_count")?;
+        Ok(StorageMaintenance {
+            database_bytes: file_size(&self.path),
+            wal_bytes: file_size(&self.path.with_extension("sqlite-wal")),
+            page_size,
+            page_count,
+            free_pages: free_after,
+            checkpointed_frames: checkpointed,
+            remaining_wal_frames: if busy == 0 {
+                wal_frames.saturating_sub(checkpointed)
+            } else {
+                wal_frames
+            },
+            vacuumed_pages: free_before.saturating_sub(free_after),
+        })
+    }
+}
+
+fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, StorageError> {
+    connection
+        .query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, u64>(0))
+        .map_err(database_error)
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn secure_database_files(path: &Path) -> Result<(), StorageError> {
+    use std::os::unix::fs::PermissionsExt;
+    for candidate in [
+        path.to_path_buf(),
+        path.with_extension("sqlite-wal"),
+        path.with_extension("sqlite-shm"),
+    ] {
+        if candidate.exists() {
+            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+                .map_err(StorageError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_database_files(_path: &Path) -> Result<(), StorageError> {
+    Ok(())
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
@@ -1132,5 +1203,52 @@ mod tests {
         assert_eq!(integer("wal_autocheckpoint"), 128);
         assert_eq!(integer("busy_timeout"), 5000);
         assert_eq!(integer("auto_vacuum"), 2);
+    }
+
+    #[test]
+    fn maintenance_reports_sizes_checkpoints_and_bounds_vacuum() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("maintenance.sqlite");
+        let mut storage = SqliteStorage::open(&path).unwrap();
+        for n in 0..32_u8 {
+            storage
+                .insert_message(&StoredMessage::new(
+                    [n; 32],
+                    [n.wrapping_add(1); 32],
+                    [n; 16],
+                    i64::from(n),
+                    0,
+                    vec![n; 4096],
+                    false,
+                ))
+                .unwrap();
+        }
+        storage.remove_messages_stored_before(i64::MAX, 64).unwrap();
+        let maintenance = storage.maintain(4).unwrap();
+        assert!(maintenance.database_bytes > 0);
+        assert!(maintenance.page_size > 0);
+        assert!(maintenance.page_count > 0);
+        assert!(maintenance.vacuumed_pages <= 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_sidecars_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private.sqlite");
+        let _storage = SqliteStorage::open(&path).unwrap();
+        for candidate in [
+            path.clone(),
+            path.with_extension("sqlite-wal"),
+            path.with_extension("sqlite-shm"),
+        ] {
+            if candidate.exists() {
+                assert_eq!(
+                    std::fs::metadata(candidate).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
     }
 }

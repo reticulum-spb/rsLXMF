@@ -447,6 +447,7 @@ struct LxmdRunner {
     last_node_announce: f64,
     last_propagation_check: f64,
     last_storage_checkpoint: f64,
+    last_storage_maintenance: f64,
     last_cull: f64,
     last_ratchet_clean: f64,
     last_route_refresh: f64,
@@ -509,9 +510,17 @@ impl LxmdRunner {
             &hex::encode(lxmf_dest_hash)[..16],
         );
 
-        std::fs::create_dir_all(&paths.lxmf_storage_dir)?;
+        let database_path = paths.configured_database_path(config.database_path.as_deref());
+        let database_parent = database_path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SQLite database path has no parent",
+            )
+        })?;
+        std::fs::create_dir_all(database_parent)?;
         let (mut router, storage) =
-            create_router_with_sqlite(&config, transport_tx.clone(), &paths.database_path)?;
+            create_router_with_sqlite(&config, transport_tx.clone(), &database_path)?;
+        tracing::info!(path = %database_path.display(), "SQLite storage opened");
         let persisted_peers = router.load_persisted_peers();
         tracing::info!(persisted_peers, "Propagation peers loaded from SQLite");
 
@@ -880,6 +889,7 @@ impl LxmdRunner {
             last_node_announce: 0.0,
             last_propagation_check: 0.0,
             last_storage_checkpoint: now,
+            last_storage_maintenance: now,
             last_cull: now,
             last_ratchet_clean: now,
             last_route_refresh: 0.0,
@@ -1569,6 +1579,62 @@ impl LxmdRunner {
                 tracing::warn!(%error, "failed to checkpoint propagation peers");
             }
             self.last_storage_checkpoint = now;
+        }
+
+        if now - self.last_storage_maintenance >= self.config.vacuum_interval as f64 {
+            let active_transfer = self
+                .propagation_node
+                .as_ref()
+                .and_then(|node| node.lock().ok())
+                .is_some_and(|node| node.has_active_sync_sessions());
+            if !active_transfer {
+                let started = Instant::now();
+                match self.router.maintain_storage(self.config.vacuum_pages) {
+                    Ok(stats) => {
+                        let physical_bytes = stats.database_bytes.saturating_add(stats.wal_bytes);
+                        if let Some(limit) = self.config.message_storage_limit
+                            && physical_bytes > limit as u64
+                            && let Some(node) = self.propagation_node.as_ref()
+                            && let Ok(mut node) = node.lock()
+                        {
+                            let overage = physical_bytes
+                                .saturating_sub(limit as u64)
+                                .min(usize::MAX as u64)
+                                as usize;
+                            match node.reclaim_physical_overage(overage) {
+                                Ok(removed) => tracing::warn!(
+                                    physical_bytes,
+                                    limit,
+                                    removed,
+                                    "SQLite storage budget exceeded; reclaimed propagation messages"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    physical_bytes,
+                                    limit,
+                                    "failed to reclaim SQLite storage overage"
+                                ),
+                            }
+                        }
+                        tracing::info!(
+                            database_bytes = stats.database_bytes,
+                            wal_bytes = stats.wal_bytes,
+                            page_size = stats.page_size,
+                            page_count = stats.page_count,
+                            free_pages = stats.free_pages,
+                            checkpointed_frames = stats.checkpointed_frames,
+                            remaining_wal_frames = stats.remaining_wal_frames,
+                            vacuumed_pages = stats.vacuumed_pages,
+                            duration_ms = started.elapsed().as_millis(),
+                            "SQLite maintenance completed"
+                        )
+                    }
+                    Err(error) => tracing::warn!(%error, "SQLite maintenance failed"),
+                }
+                self.last_storage_maintenance = now;
+            } else {
+                tracing::debug!("deferring SQLite vacuum during active propagation transfer");
+            }
         }
 
         // 15-minute interval matches Python's CLEAN_INTERVAL.

@@ -136,6 +136,18 @@ pub struct StoredRatchet {
     pub received_at: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageMaintenance {
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub page_size: u64,
+    pub page_count: u64,
+    pub free_pages: u64,
+    pub checkpointed_frames: u64,
+    pub remaining_wal_frames: u64,
+    pub vacuumed_pages: u64,
+}
+
 /// Synchronous because the router/storage actor owns each implementation.
 pub trait LxmfStorage: Send {
     fn contains_transient_id(
@@ -287,6 +299,7 @@ pub trait LxmfStorage: Send {
     fn contains_inbound_message(&self, message_id: &[u8; 32]) -> Result<bool, StorageError>;
     fn replace_peers(&mut self, peers: &[([u8; 16], Vec<u8>)]) -> Result<(), StorageError>;
     fn peer_page(&self, limit: usize) -> Result<Vec<([u8; 16], Vec<u8>)>, StorageError>;
+    fn maintain(&mut self, vacuum_pages: u32) -> Result<StorageMaintenance, StorageError>;
 }
 
 #[derive(Debug, Default)]
@@ -719,6 +732,9 @@ impl LxmfStorage for MemoryStorage {
             .take(limit)
             .map(|(h, v)| (*h, v.clone()))
             .collect())
+    }
+    fn maintain(&mut self, _vacuum_pages: u32) -> Result<StorageMaintenance, StorageError> {
+        Ok(StorageMaintenance::default())
     }
 }
 

@@ -15,8 +15,9 @@ use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::stamper;
 use crate::storage::{
-    LxmfStorage, MemoryStorage, StorageError, StoredIdentity, StoredMessageMetadata,
-    StoredOutboundMessage, StoredOutboundMetadata, StoredRatchet, StoredStampCost, TransientIdKind,
+    LxmfStorage, MemoryStorage, StorageError, StorageMaintenance, StoredIdentity,
+    StoredMessageMetadata, StoredOutboundMessage, StoredOutboundMetadata, StoredRatchet,
+    StoredStampCost, TransientIdKind,
 };
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
@@ -519,6 +520,12 @@ impl LxmRouter {
             .map(|(hash, peer)| (*hash, peer.to_bytes_with_handled()))
             .collect::<Vec<_>>();
         self.storage.replace_peers(&peers)
+    }
+    pub fn maintain_storage(
+        &mut self,
+        vacuum_pages: u32,
+    ) -> Result<StorageMaintenance, StorageError> {
+        self.storage.maintain(vacuum_pages)
     }
 
     fn persist_outbound_message(&mut self, message: &LxMessage, deferred: bool) -> bool {

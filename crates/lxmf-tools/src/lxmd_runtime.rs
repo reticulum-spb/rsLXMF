@@ -44,6 +44,14 @@ impl LxmdPaths {
             &self.legacy_identity_path
         }
     }
+
+    pub fn configured_database_path(&self, override_path: Option<&Path>) -> PathBuf {
+        match override_path {
+            Some(path) if path.is_absolute() => path.to_path_buf(),
+            Some(path) => self.config_dir.join(path),
+            None => self.database_path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +294,14 @@ mod tests {
         assert_eq!(
             paths.database_path,
             PathBuf::from("/tmp/lxmd-config/storage/lxmf/lxmf.sqlite")
+        );
+        assert_eq!(
+            paths.configured_database_path(Some(Path::new("data/custom.sqlite"))),
+            PathBuf::from("/tmp/lxmd-config/data/custom.sqlite")
+        );
+        assert_eq!(
+            paths.configured_database_path(Some(Path::new("/var/lib/lxmf.sqlite"))),
+            PathBuf::from("/var/lib/lxmf.sqlite")
         );
     }
 

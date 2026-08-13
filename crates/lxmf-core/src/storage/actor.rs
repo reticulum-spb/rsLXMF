@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::{
-    LxmfStorage, MessageStoreStats, StorageError, StoredIdentity, StoredMessage,
-    StoredMessageMetadata, StoredOutboundMessage, StoredOutboundMetadata, StoredRatchet,
-    StoredStampCost, TransientIdKind,
+    LxmfStorage, MessageStoreStats, StorageError, StorageMaintenance, StoredIdentity,
+    StoredMessage, StoredMessageMetadata, StoredOutboundMessage, StoredOutboundMetadata,
+    StoredRatchet, StoredStampCost, TransientIdKind,
 };
 use crate::types::PropagationTransientId;
 
@@ -418,6 +418,9 @@ impl LxmfStorage for StorageHandle {
     }
     fn peer_page(&self, limit: usize) -> Result<Vec<([u8; 16], Vec<u8>)>, StorageError> {
         self.call(move |s| s.peer_page(limit))
+    }
+    fn maintain(&mut self, vacuum_pages: u32) -> Result<StorageMaintenance, StorageError> {
+        self.call(move |s| s.maintain(vacuum_pages))
     }
 }
 

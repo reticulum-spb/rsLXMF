@@ -6,6 +6,7 @@ use lxmf_core::constants::*;
 use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
 use lxmf_core::storage::{StorageError, StorageHandle, spawn_sqlite_storage_actor};
 use rns_runtime::config::{Config, ConfigSection};
+use std::path::PathBuf;
 
 /// Normalized view of Python `lxmd.apply_config()` behavior.
 ///
@@ -164,6 +165,12 @@ pub struct DaemonConfig {
     pub prioritise_destinations: Vec<String>,
     pub enforce_stamps: bool,
     pub message_storage_limit: Option<usize>,
+    /// Optional SQLite path; relative values are resolved from the LXMF config directory.
+    pub database_path: Option<PathBuf>,
+    /// Period between passive WAL checkpoint / incremental vacuum passes.
+    pub vacuum_interval: u64,
+    /// Maximum freelist pages reclaimed in one maintenance pass.
+    pub vacuum_pages: u32,
     pub from_static_only: bool,
     /// Max accepted inbound delivery transfer size in KB. Python reference:
     /// `delivery_transfer_max_accepted_size` in `lxmd.py`.
@@ -198,6 +205,9 @@ impl Default for DaemonConfig {
             prioritise_destinations: Vec::new(),
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
+            database_path: None,
+            vacuum_interval: 3600,
+            vacuum_pages: 128,
             from_static_only: false,
             delivery_transfer_max_accepted_size: DELIVERY_LIMIT,
         }
@@ -299,6 +309,21 @@ impl DaemonConfig {
                 dc.propagation_limit_kb = limit as usize;
             }
             dc.enforce_stamps = sec.get_bool_or("enforce_stamps", false);
+        }
+
+        if let Some(sec) = config.section("storage") {
+            if let Some(path) = sec.get("database_path") {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    dc.database_path = Some(PathBuf::from(trimmed));
+                }
+            }
+            if let Some(interval) = sec.get_uint("vacuum_interval") {
+                dc.vacuum_interval = interval.max(60);
+            }
+            if let Some(pages) = sec.get_uint("vacuum_pages") {
+                dc.vacuum_pages = pages.min(u32::MAX as u64) as u32;
+            }
         }
 
         if let Some(sec) = config.section("control") {
@@ -675,6 +700,21 @@ propagation_stamp_cost = 19
 
         assert_eq!(dc.propagation_stamp_cost, 19);
         assert_eq!(dc.to_router_config().propagation_stamp_cost, 19);
+    }
+
+    #[test]
+    fn storage_maintenance_config_is_bounded() {
+        let config = Config::parse(
+            "[storage]\ndatabase_path = data/custom.sqlite\nvacuum_interval = 1\nvacuum_pages = 42\n",
+        )
+        .unwrap();
+        let parsed = DaemonConfig::from_config(&config);
+        assert_eq!(
+            parsed.database_path.as_deref(),
+            Some(std::path::Path::new("data/custom.sqlite"))
+        );
+        assert_eq!(parsed.vacuum_interval, 60);
+        assert_eq!(parsed.vacuum_pages, 42);
     }
 
     /// Python lxmd exposes no enforce_ratchets option; the key must parse as a no-op.

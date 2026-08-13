@@ -205,6 +205,16 @@ autopeer_maxdepth = 6
 auth_required = no
 
 
+[storage]
+
+# Absolute path, or a path relative to the LXMF config directory.
+# database_path = storage/lxmf/lxmf.sqlite
+
+# SQLite maintenance period in seconds (minimum 60) and maximum pages reclaimed per pass.
+vacuum_interval = 3600
+vacuum_pages = 128
+
+
 [lxmf]
 
 display_name = Anonymous Peer

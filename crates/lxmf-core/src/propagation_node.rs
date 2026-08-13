@@ -12,7 +12,7 @@ use crate::constants::*;
 use crate::message::LxMessage;
 use crate::peer::LxmPeer;
 use crate::propagation::{PropagationEntry, PropagationStore, hex_encode};
-use crate::storage::{LxmfStorage, MemoryStorage, StoredMessage};
+use crate::storage::{LxmfStorage, MemoryStorage, StorageError, StoredMessage};
 use crate::sync::{OfferResponse, SyncGet, SyncOffer, SyncSession};
 use crate::types::PropagationTransientId;
 
@@ -822,6 +822,25 @@ impl PropagationNode {
 
     pub fn remove_session(&mut self, peer_hash: &[u8; 16]) {
         self.sync_sessions.remove(peer_hash);
+    }
+
+    pub fn has_active_sync_sessions(&self) -> bool {
+        !self.sync_sessions.is_empty()
+    }
+
+    /// Best-effort reduction of propagation payload when physical SQLite
+    /// allocation exceeds the configured message-storage budget.
+    pub fn reclaim_physical_overage(&mut self, bytes: usize) -> Result<usize, StorageError> {
+        if !self.storage_authoritative || bytes == 0 {
+            return Ok(0);
+        }
+        let prioritised = self
+            .prioritised_destinations
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        self.storage
+            .remove_messages_by_weight(bytes, crate::now_f64() as i64, &prioritised, 128)
     }
 
     pub fn save_peer(&self, peer: &LxmPeer) -> std::io::Result<()> {

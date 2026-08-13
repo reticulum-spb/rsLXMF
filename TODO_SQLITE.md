@@ -137,8 +137,8 @@
 
 ## 4. Конфигурация базы
 
-- [ ] Добавить конфигурируемый override пути к SQLite database (стандартный
-  путь уже добавлен).
+- [x] Добавить `[storage] database_path` с абсолютным путём или разрешением
+  относительного пути от LXMF config directory.
 - [ ] Добавить конфигурируемый предел SQLite page cache.
 - [x] Установить и протестировать:
   - [x] `journal_mode=WAL`;
@@ -150,11 +150,11 @@
   - [x] `busy_timeout`;
   - [x] `auto_vacuum=INCREMENTAL`.
 - [x] Проверять фактически применённый journal mode.
-- [ ] Установить безопасные filesystem permissions для файла базы, WAL и SHM.
+- [x] Установить безопасные filesystem permissions `0600` для файла базы, WAL и SHM на Unix.
 - [ ] Определить поведение при read-only filesystem.
 - [ ] Определить поведение при отсутствии места на диске.
-- [ ] Определить политику WAL checkpoint.
-- [ ] Не запускать автоматический полный `VACUUM`.
+- [x] Определить политику WAL checkpoint: периодический PASSIVE checkpoint на storage worker.
+- [x] Не запускать автоматический полный `VACUUM`.
 
 ## 5. Transient ID store — первый функциональный этап
 
@@ -260,17 +260,18 @@
 ## 10. Ограничение дискового пространства и обслуживание
 
 - [ ] Учитывать размер payload отдельно от размера файла БД.
-- [ ] Контролировать размер основного файла, WAL и свободное место.
+- [x] Контролировать размер основного файла, WAL и SQLite freelist.
 - [ ] Оставлять резерв для checkpoint и транзакций.
-- [ ] Определить поведение при достижении storage limit.
-- [ ] Определить порядок удаления сообщений при нехватке места.
-- [ ] Реализовать ограниченный incremental vacuum.
-- [ ] Не выполнять vacuum во время активной resource transfer.
+- [x] Определить поведение при достижении storage limit: удалять только
+  propagation payload, не затрагивая durable outbound/inbound/crypto state.
+- [x] Определить порядок удаления сообщений через существующую weighted policy.
+- [x] Реализовать ограниченный incremental vacuum.
+- [x] Не выполнять vacuum во время активной propagation sync/resource transfer.
 - [ ] Добавить maintenance metrics:
-  - [ ] database size;
-  - [ ] WAL size;
-  - [ ] free pages;
-  - [ ] last checkpoint duration;
+  - [x] database size;
+  - [x] WAL size;
+  - [x] free pages;
+  - [x] last checkpoint/maintenance duration;
   - [ ] last cull duration.
 - [ ] Проверить износ и объём записи на SD-карту.
 
