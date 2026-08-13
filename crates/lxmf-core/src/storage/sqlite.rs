@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use super::{
     LxmfStorage, MessageStoreStats, StorageError, StoredMessage, StoredMessageMetadata,
@@ -281,6 +281,71 @@ impl LxmfStorage for SqliteStorage {
                 params![cutoff, usize_to_i64(limit)?],
             )
             .map_err(database_error)
+    }
+
+    fn remove_messages_by_weight(
+        &mut self,
+        bytes_to_remove: usize,
+        now: i64,
+        prioritised_destinations: &[[u8; 16]],
+        limit: usize,
+    ) -> Result<usize, StorageError> {
+        if bytes_to_remove == 0 || limit == 0 {
+            return Ok(0);
+        }
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        let priority_clause = if prioritised_destinations.is_empty() {
+            "0".to_string()
+        } else {
+            std::iter::repeat_n("?", prioritised_destinations.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let query = format!(
+            "SELECT transient_id, payload_size FROM messages
+             ORDER BY
+               (CASE WHEN destination_hash IN ({priority_clause}) THEN 0.1 ELSE 1.0 END) *
+               MAX(1.0, (? - stored_at) / 345600.0) * payload_size DESC,
+               transient_id
+             LIMIT ?"
+        );
+        let mut parameters = prioritised_destinations
+            .iter()
+            .map(|destination| Value::Blob(destination.to_vec()))
+            .collect::<Vec<_>>();
+        parameters.push(Value::Integer(now));
+        parameters.push(Value::Integer(usize_to_i64(limit)?));
+
+        let selected = {
+            let mut statement = transaction.prepare(&query).map_err(database_error)?;
+            let rows = statement
+                .query_map(params_from_iter(parameters), |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(database_error)?;
+            let mut selected = Vec::new();
+            let mut selected_bytes = 0usize;
+            for row in rows {
+                if selected_bytes >= bytes_to_remove {
+                    break;
+                }
+                let (transient_id, payload_size) = row.map_err(database_error)?;
+                selected_bytes =
+                    selected_bytes.saturating_add(i64_to_usize(payload_size, "payload size")?);
+                selected.push(transient_id);
+            }
+            selected
+        };
+        {
+            let mut delete = transaction
+                .prepare("DELETE FROM messages WHERE transient_id = ?1")
+                .map_err(database_error)?;
+            for transient_id in &selected {
+                delete.execute([transient_id]).map_err(database_error)?;
+            }
+        }
+        transaction.commit().map_err(database_error)?;
+        Ok(selected.len())
     }
 }
 

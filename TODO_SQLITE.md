@@ -189,15 +189,15 @@
 - [x] Реализовать получение `stamp_value` через metadata.
 - [x] Реализовать `COUNT(*)` и `SUM(payload_size)`.
 - [x] Реализовать expiry culling пакетами без загрузки payload.
-- [ ] Реализовать weighted culling пакетами.
-- [ ] Учесть prioritised destinations при weighted culling.
-- [ ] Сделать удаление выбранных кандидатов одной транзакцией.
+- [x] Реализовать weighted culling пакетами.
+- [x] Учесть prioritised destinations при weighted culling.
+- [x] Сделать удаление выбранных кандидатов одной транзакцией.
 - [ ] Перевести peer distribution на хранение только transient IDs.
 - [x] Не загружать payload при составлении offers и статистики.
 - [ ] Проверить необходимость incremental BLOB I/O.
 - [x] Ограничить число одновременно загруженных крупных payload.
 - [x] Добавить тесты storage limit.
-- [ ] Добавить тесты weighted culling.
+- [x] Добавить тесты weighted culling.
 - [x] Добавить тесты сообщений с максимальным payload.
 - [ ] Добавить тест восстановления после прерывания вставки.
 

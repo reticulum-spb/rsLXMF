@@ -607,11 +607,21 @@ impl LxmdRunner {
                     .saturating_sub(config.propagation_stamp_flex),
                 ..Default::default()
             };
-            let pn = Arc::new(Mutex::new(PropagationNode::with_shared_storage_backend(
+            let mut propagation_node = PropagationNode::with_shared_storage_backend(
                 pn_config,
                 propagation_dest_hash,
                 storage.clone(),
-            )));
+            );
+            for configured in &config.prioritise_destinations {
+                match parse_destination_hash(configured) {
+                    Ok(hash) => propagation_node.prioritise_destination(hash),
+                    Err(error) => tracing::warn!(
+                        hash = %configured,
+                        "ignoring invalid prioritised destination hash for propagation node: {error}"
+                    ),
+                }
+            }
+            let pn = Arc::new(Mutex::new(propagation_node));
 
             // TODO(hardware-identity): route propagation link signing through the
             // backend-aware Identity path before supporting hardware-backed lxmd.

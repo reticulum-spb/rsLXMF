@@ -163,6 +163,16 @@ pub trait LxmfStorage: Send {
         cutoff: i64,
         limit: usize,
     ) -> Result<usize, StorageError>;
+
+    /// Remove the highest weighted messages in one atomic batch, stopping
+    /// after at least `bytes_to_remove` bytes or `limit` rows are selected.
+    fn remove_messages_by_weight(
+        &mut self,
+        bytes_to_remove: usize,
+        now: i64,
+        prioritised_destinations: &[[u8; 16]],
+        limit: usize,
+    ) -> Result<usize, StorageError>;
 }
 
 #[derive(Debug, Default)]
@@ -326,6 +336,57 @@ impl LxmfStorage for MemoryStorage {
         }
         Ok(count)
     }
+
+    fn remove_messages_by_weight(
+        &mut self,
+        bytes_to_remove: usize,
+        now: i64,
+        prioritised_destinations: &[[u8; 16]],
+        limit: usize,
+    ) -> Result<usize, StorageError> {
+        let prioritised = prioritised_destinations
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut candidates = self
+            .messages
+            .values()
+            .map(|message| {
+                let metadata = &message.metadata;
+                let age_weight = (((now - metadata.stored_at) as f64) / 345_600.0).max(1.0);
+                let priority_weight = if prioritised.contains(&metadata.destination_hash) {
+                    0.1
+                } else {
+                    1.0
+                };
+                (
+                    metadata.transient_id,
+                    metadata.payload_size,
+                    priority_weight * age_weight * metadata.payload_size as f64,
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .2
+                .total_cmp(&left.2)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0usize;
+        for (transient_id, payload_size, _) in candidates.into_iter().take(limit) {
+            if selected_bytes >= bytes_to_remove {
+                break;
+            }
+            selected.push(transient_id);
+            selected_bytes = selected_bytes.saturating_add(payload_size);
+        }
+        for transient_id in &selected {
+            self.messages.remove(transient_id);
+        }
+        Ok(selected.len())
+    }
 }
 
 fn validate_message(message: &StoredMessage) -> Result<(), StorageError> {
@@ -470,11 +531,47 @@ mod tests {
         assert_eq!(storage.remove_messages_stored_before(300, 10).unwrap(), 0);
     }
 
+    fn weighted_culling_contract(storage: &mut dyn LxmfStorage) {
+        let prioritised_destination = [0xAA; 16];
+        let prioritised = StoredMessage::new(
+            [0x11; 32],
+            [0x21; 32],
+            prioritised_destination,
+            1_000,
+            0,
+            vec![0; 50],
+            false,
+        );
+        let ordinary = StoredMessage::new(
+            [0x12; 32],
+            [0x22; 32],
+            [0xBB; 16],
+            1_000,
+            0,
+            vec![0; 10],
+            false,
+        );
+        storage.insert_message(&prioritised).unwrap();
+        storage.insert_message(&ordinary).unwrap();
+
+        assert_eq!(
+            storage
+                .remove_messages_by_weight(1, 1_000, &[prioritised_destination], 1)
+                .unwrap(),
+            1
+        );
+        assert!(storage.message_metadata(&[0x11; 32]).unwrap().is_some());
+        assert!(storage.message_metadata(&[0x12; 32]).unwrap().is_none());
+        assert_eq!(storage.message_store_stats().unwrap().payload_size, 50);
+    }
+
     #[test]
     fn memory_storage_contract() {
         let mut storage = MemoryStorage::new();
         transient_contract(&mut storage);
         message_contract(&mut storage);
+        let mut weighted_storage = MemoryStorage::new();
+        weighted_culling_contract(&mut weighted_storage);
     }
 
     #[cfg(feature = "sqlite")]
@@ -485,6 +582,9 @@ mod tests {
         let mut storage = SqliteStorage::open(&path).unwrap();
         transient_contract(&mut storage);
         message_contract(&mut storage);
+        let weighted_path = directory.path().join("weighted.sqlite");
+        let mut weighted_storage = SqliteStorage::open(&weighted_path).unwrap();
+        weighted_culling_contract(&mut weighted_storage);
 
         storage
             .upsert_transient_id(TransientIdKind::LocallyDelivered, [0x44; 32], 300)

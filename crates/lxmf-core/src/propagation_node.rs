@@ -175,6 +175,7 @@ pub struct PropagationNode {
     storage: Box<dyn LxmfStorage>,
     storage_reader: Option<crate::storage::StorageHandle>,
     storage_authoritative: bool,
+    prioritised_destinations: HashSet<[u8; 16]>,
     sync_sessions: HashMap<[u8; 16], SyncSession>,
     pub dest_hash: [u8; 16],
     storage_path: Option<PathBuf>,
@@ -191,6 +192,7 @@ impl PropagationNode {
             storage: Box::new(MemoryStorage::new()),
             storage_reader: None,
             storage_authoritative: false,
+            prioritised_destinations: HashSet::new(),
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: None,
@@ -209,6 +211,7 @@ impl PropagationNode {
             storage,
             storage_reader: None,
             storage_authoritative: true,
+            prioritised_destinations: HashSet::new(),
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: None,
@@ -229,6 +232,7 @@ impl PropagationNode {
             storage: Box::new(storage.clone()),
             storage_reader: Some(storage),
             storage_authoritative: true,
+            prioritised_destinations: HashSet::new(),
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: None,
@@ -244,6 +248,16 @@ impl PropagationNode {
         self.config.min_stamp_cost = cost;
     }
 
+    pub fn prioritise_destination(&mut self, destination_hash: [u8; 16]) {
+        self.prioritised_destinations.insert(destination_hash);
+        self.store.prioritise_destination(destination_hash);
+    }
+
+    pub fn unprioritise_destination(&mut self, destination_hash: &[u8; 16]) {
+        self.prioritised_destinations.remove(destination_hash);
+        self.store.unprioritise_destination(destination_hash);
+    }
+
     /// Disk-backed node. Loads existing messages from `storage_path` on startup.
     pub fn with_storage(
         config: PropagationNodeConfig,
@@ -257,6 +271,7 @@ impl PropagationNode {
             storage: Box::new(MemoryStorage::new()),
             storage_reader: None,
             storage_authoritative: false,
+            prioritised_destinations: HashSet::new(),
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: Some(storage_path),
@@ -606,6 +621,33 @@ impl PropagationNode {
                     Ok(_) => break,
                     Err(error) => {
                         tracing::warn!(%error, "failed to cull expired propagation messages");
+                        break;
+                    }
+                }
+            }
+            loop {
+                let Ok(stats) = self.storage.message_store_stats() else {
+                    break;
+                };
+                let bytes_to_remove = stats.payload_size.saturating_sub(self.config.max_storage);
+                if bytes_to_remove == 0 {
+                    break;
+                }
+                let prioritised = self
+                    .prioritised_destinations
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                match self.storage.remove_messages_by_weight(
+                    bytes_to_remove,
+                    now as i64,
+                    &prioritised,
+                    128,
+                ) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to enforce propagation storage limit");
                         break;
                     }
                 }
@@ -1793,6 +1835,34 @@ mod tests {
             0,
             "tick must cull the store down to the weight cap"
         );
+    }
+
+    #[test]
+    fn authoritative_tick_culls_weighted_messages_and_preserves_priority() {
+        let prioritised_destination = [0xBB; 16];
+        let ordinary_destination = [0xCC; 16];
+        let prioritised = [prioritised_destination.as_slice(), &[0x01; 32]].concat();
+        let ordinary = [ordinary_destination.as_slice(), &[0x02; 32]].concat();
+        let prioritised_id = rns_crypto::sha::full_hash(&prioritised);
+        let ordinary_id = rns_crypto::sha::full_hash(&ordinary);
+        let mut node = PropagationNode::with_storage_backend(
+            PropagationNodeConfig {
+                max_storage: prioritised.len() + ordinary.len(),
+                ..Default::default()
+            },
+            [0xAA; 16],
+            Box::new(MemoryStorage::new()),
+        );
+        node.prioritise_destination(prioritised_destination);
+        assert!(node.accept_propagated_blob(&prioritised, 0));
+        assert!(node.accept_propagated_blob(&ordinary, 0));
+
+        node.config.max_storage = prioritised.len();
+        node.tick();
+
+        assert!(node.contains(&prioritised_id));
+        assert!(!node.contains(&ordinary_id));
+        assert_eq!(node.total_size(), prioritised.len());
     }
 
     #[test]

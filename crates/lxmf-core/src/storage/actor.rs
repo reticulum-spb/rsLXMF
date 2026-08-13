@@ -221,6 +221,24 @@ impl LxmfStorage for StorageHandle {
     ) -> Result<usize, StorageError> {
         self.call(move |storage| storage.remove_messages_stored_before(cutoff, limit))
     }
+
+    fn remove_messages_by_weight(
+        &mut self,
+        bytes_to_remove: usize,
+        now: i64,
+        prioritised_destinations: &[[u8; 16]],
+        limit: usize,
+    ) -> Result<usize, StorageError> {
+        let prioritised_destinations = prioritised_destinations.to_vec();
+        self.call(move |storage| {
+            storage.remove_messages_by_weight(
+                bytes_to_remove,
+                now,
+                &prioritised_destinations,
+                limit,
+            )
+        })
+    }
 }
 
 #[cfg(test)]
