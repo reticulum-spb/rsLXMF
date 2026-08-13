@@ -536,7 +536,7 @@ impl LxmdRunner {
         );
 
         std::fs::create_dir_all(&paths.lxmf_storage_dir)?;
-        let router =
+        let (router, storage) =
             create_router_with_sqlite(&config, transport_tx.clone(), &paths.database_path)?;
 
         // LinkManager handles link handshakes (ECDH), keepalive, identification,
@@ -607,31 +607,11 @@ impl LxmdRunner {
                     .saturating_sub(config.propagation_stamp_flex),
                 ..Default::default()
             };
-            let prop_storage_path = paths.propagation_store_dir.clone();
-            let pn = match PropagationNode::with_storage(
+            let pn = Arc::new(Mutex::new(PropagationNode::with_storage_backend(
                 pn_config,
                 propagation_dest_hash,
-                prop_storage_path,
-            ) {
-                Ok(node) => Arc::new(Mutex::new(node)),
-                Err(e) => {
-                    tracing::warn!("Propagation disk storage failed, using in-memory: {e}");
-                    Arc::new(Mutex::new(PropagationNode::new(
-                        PropagationNodeConfig {
-                            max_storage: config
-                                .message_storage_limit
-                                .unwrap_or(config.propagation_limit_kb * 1024),
-                            max_message_size: config.propagation_limit_kb * 1024,
-                            max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
-                            min_stamp_cost: config
-                                .propagation_stamp_cost
-                                .saturating_sub(config.propagation_stamp_flex),
-                            ..Default::default()
-                        },
-                        propagation_dest_hash,
-                    )))
-                }
-            };
+                Box::new(storage.clone()),
+            )));
 
             // TODO(hardware-identity): route propagation link signing through the
             // backend-aware Identity path before supporting hardware-backed lxmd.

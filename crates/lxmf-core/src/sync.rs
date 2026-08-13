@@ -250,6 +250,13 @@ impl SyncSession {
 
     /// Process a received offer; returns a SyncGet for IDs we don't have.
     pub fn process_offer(&mut self, offer: &SyncOffer, our_store: &PropagationStore) -> SyncGet {
+        self.process_offer_with(offer, |transient_id| our_store.contains(transient_id))
+    }
+
+    pub fn process_offer_with<F>(&mut self, offer: &SyncOffer, mut contains: F) -> SyncGet
+    where
+        F: FnMut(&PropagationTransientId) -> bool,
+    {
         let wanted: Vec<Vec<u8>> = offer
             .transient_ids
             .iter()
@@ -257,7 +264,7 @@ impl SyncSession {
                 if id.len() == 32 {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(id);
-                    !our_store.contains(&arr)
+                    !contains(&arr)
                 } else {
                     false
                 }

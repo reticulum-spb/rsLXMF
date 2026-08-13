@@ -115,7 +115,7 @@
 - [x] Хранить metadata и payload одной атомарной storage operation;
   transient-ID batch выполняется отдельной транзакцией.
 - [x] Реализовать `MemoryStorage` для быстрых unit-тестов.
-- [ ] Перевести `LxmRouter` и `PropagationNode` на storage abstraction с
+- [x] Перевести `LxmRouter` и production `PropagationNode` на storage abstraction с
   `MemoryStorage`, не меняя поведение.
 - [x] Передавать storage через constructor/builder, не через глобальный
   singleton.
@@ -193,7 +193,7 @@
 - [ ] Учесть prioritised destinations при weighted culling.
 - [ ] Сделать удаление выбранных кандидатов одной транзакцией.
 - [ ] Перевести peer distribution на хранение только transient IDs.
-- [ ] Не загружать payload при составлении offers и статистики.
+- [x] Не загружать payload при составлении offers и статистики.
 - [ ] Проверить необходимость incremental BLOB I/O.
 - [ ] Ограничить число одновременно загруженных крупных payload.
 - [ ] Добавить тесты storage limit.
@@ -203,11 +203,11 @@
 
 ## 7. Отказ от отдельных message-файлов
 
-- [ ] Удалить создание новых `.lxm`-файлов после включения SQLite backend.
-- [ ] Удалить сканирование messages directory при запуске.
-- [ ] Удалить построение RAM-индекса из имён файлов.
-- [ ] Удалить синхронизацию metadata и файлов.
-- [ ] Удалить orphan-file cleanup.
+- [x] Не создавать новые `.lxm`-файлы в production SQLite backend.
+- [x] Не сканировать messages directory при SQLite startup.
+- [x] Не строить RAM-индекс из имён файлов в SQLite backend.
+- [x] Не синхронизировать SQLite metadata с файлами.
+- [x] Не запускать orphan-file cleanup в SQLite backend.
 - [x] Одноразовую миграцию существующих файлов не реализовывать: SQLite
   storage всегда создаётся с чистого листа.
 - [ ] После переходного периода удалить устаревшие persistence-функции.

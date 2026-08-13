@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 
 use super::{
     LxmfStorage, MessageStoreStats, StorageError, StoredMessage, StoredMessageMetadata,
@@ -11,7 +11,30 @@ type StorageOperation = Box<dyn FnOnce(&mut dyn LxmfStorage) + Send>;
 /// Cloneable synchronous facade for a single dedicated storage worker.
 #[derive(Clone)]
 pub struct StorageHandle {
-    sender: mpsc::Sender<StorageOperation>,
+    inner: Arc<ActorInner>,
+}
+
+struct ActorInner {
+    sender: Mutex<Option<mpsc::Sender<StorageOperation>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl ActorInner {
+    fn new(sender: mpsc::Sender<StorageOperation>, worker: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            sender: Mutex::new(Some(sender)),
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+}
+
+impl Drop for ActorInner {
+    fn drop(&mut self) {
+        self.sender.get_mut().ok().and_then(Option::take);
+        if let Some(worker) = self.worker.get_mut().ok().and_then(Option::take) {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl StorageHandle {
@@ -21,7 +44,15 @@ impl StorageHandle {
         F: FnOnce(&mut dyn LxmfStorage) -> Result<T, StorageError> + Send + 'static,
     {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        self.sender
+        let sender = self
+            .inner
+            .sender
+            .lock()
+            .map_err(|_| StorageError::ActorUnavailable)?
+            .as_ref()
+            .cloned()
+            .ok_or(StorageError::ActorUnavailable)?;
+        sender
             .send(Box::new(move |storage| {
                 let _ = reply_tx.send(operation(storage));
             }))
@@ -37,18 +68,20 @@ where
     S: LxmfStorage + 'static,
 {
     let (sender, receiver) = mpsc::channel::<StorageOperation>();
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("lxmf-storage".into())
         .spawn(move || run_worker(Box::new(storage), receiver))
         .map_err(StorageError::Io)?;
-    Ok(StorageHandle { sender })
+    Ok(StorageHandle {
+        inner: Arc::new(ActorInner::new(sender, worker)),
+    })
 }
 
 #[cfg(feature = "sqlite")]
 pub fn spawn_sqlite_storage_actor(path: std::path::PathBuf) -> Result<StorageHandle, StorageError> {
     let (sender, receiver) = mpsc::channel::<StorageOperation>();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("lxmf-sqlite-storage".into())
         .spawn(move || match super::SqliteStorage::open(&path) {
             Ok(storage) => {
@@ -63,7 +96,9 @@ pub fn spawn_sqlite_storage_actor(path: std::path::PathBuf) -> Result<StorageHan
     ready_rx
         .recv()
         .map_err(|_| StorageError::ActorUnavailable)??;
-    Ok(StorageHandle { sender })
+    Ok(StorageHandle {
+        inner: Arc::new(ActorInner::new(sender, worker)),
+    })
 }
 
 fn run_worker(mut storage: Box<dyn LxmfStorage>, receiver: mpsc::Receiver<StorageOperation>) {

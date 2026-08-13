@@ -84,8 +84,14 @@ pub struct GetServePlan {
 
 #[derive(Debug)]
 struct PlannedRead {
-    path: PathBuf,
+    source: PlannedReadSource,
     stamped: bool,
+}
+
+#[derive(Debug)]
+enum PlannedReadSource {
+    File(PathBuf),
+    Payload(Vec<u8>),
 }
 
 impl GetServePlan {
@@ -102,8 +108,14 @@ impl GetServePlan {
         let mut messages: Vec<Value> = Vec::new();
 
         for read in &self.reads {
-            let Ok(data) = std::fs::read(&read.path) else {
-                continue;
+            let data = match &read.source {
+                PlannedReadSource::File(path) => {
+                    let Ok(data) = std::fs::read(path) else {
+                        continue;
+                    };
+                    data
+                }
+                PlannedReadSource::Payload(payload) => payload.clone(),
             };
             let next_size = cumulative_size + data.len() as f64 + PER_MESSAGE_OVERHEAD;
             if self.limit_bytes.is_some_and(|limit| next_size > limit) {
@@ -148,6 +160,7 @@ pub struct PropagationNode {
     config: PropagationNodeConfig,
     store: PropagationStore,
     storage: Box<dyn LxmfStorage>,
+    storage_authoritative: bool,
     sync_sessions: HashMap<[u8; 16], SyncSession>,
     pub dest_hash: [u8; 16],
     storage_path: Option<PathBuf>,
@@ -162,6 +175,7 @@ impl PropagationNode {
             config,
             store: PropagationStore::new(),
             storage: Box::new(MemoryStorage::new()),
+            storage_authoritative: false,
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: None,
@@ -178,6 +192,7 @@ impl PropagationNode {
             config,
             store: PropagationStore::new(),
             storage,
+            storage_authoritative: true,
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: None,
@@ -204,6 +219,7 @@ impl PropagationNode {
             config,
             store: PropagationStore::new(),
             storage: Box::new(MemoryStorage::new()),
+            storage_authoritative: false,
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: Some(storage_path),
@@ -231,13 +247,9 @@ impl PropagationNode {
         };
 
         let transient_id = message.transient_id.unwrap_or(hash);
-        if self.store.contains(&transient_id) {
+        if self.contains(&transient_id) {
             return false;
         }
-        if self.store.total_size() > self.config.max_storage {
-            return false;
-        }
-
         let packed = match message.pack() {
             Ok(p) => p,
             Err(_) => return false,
@@ -245,6 +257,12 @@ impl PropagationNode {
         let msg_size = packed.len();
 
         if msg_size > self.config.max_message_size {
+            return false;
+        }
+        if (self.storage_authoritative
+            && self.total_size().saturating_add(msg_size) > self.config.max_storage)
+            || (!self.storage_authoritative && self.total_size() > self.config.max_storage)
+        {
             return false;
         }
 
@@ -285,6 +303,9 @@ impl PropagationNode {
         if !matches!(self.storage.insert_message(&stored), Ok(true)) {
             return false;
         }
+        if self.storage_authoritative {
+            return true;
+        }
 
         if let Some(ref dir) = self.storage_path {
             let path = dir.join(entry.filename());
@@ -313,13 +334,16 @@ impl PropagationNode {
         }
 
         let transient_id = rns_crypto::sha::full_hash(lxmf_data);
-        if self.store.contains(&transient_id) {
-            return false;
-        }
-        if self.store.total_size() > self.config.max_storage {
+        if self.contains(&transient_id) {
             return false;
         }
         if lxmf_data.len() > self.config.max_message_size {
+            return false;
+        }
+        if (self.storage_authoritative
+            && self.total_size().saturating_add(lxmf_data.len()) > self.config.max_storage)
+            || (!self.storage_authoritative && self.total_size() > self.config.max_storage)
+        {
             return false;
         }
 
@@ -345,6 +369,9 @@ impl PropagationNode {
         );
         if !matches!(self.storage.insert_message(&stored), Ok(true)) {
             return false;
+        }
+        if self.storage_authoritative {
+            return true;
         }
 
         if let Some(ref dir) = self.storage_path {
@@ -377,7 +404,7 @@ impl PropagationNode {
         }
 
         let transient_id = rns_crypto::sha::full_hash(lxmf_data);
-        if self.store.contains(&transient_id) {
+        if self.contains(&transient_id) {
             return false;
         }
 
@@ -385,10 +412,13 @@ impl PropagationNode {
         stored_data.extend_from_slice(lxmf_data);
         stored_data.extend_from_slice(stamp_data);
 
-        if self.store.total_size() > self.config.max_storage {
+        if stored_data.len() > self.config.max_message_size {
             return false;
         }
-        if stored_data.len() > self.config.max_message_size {
+        if (self.storage_authoritative
+            && self.total_size().saturating_add(stored_data.len()) > self.config.max_storage)
+            || (!self.storage_authoritative && self.total_size() > self.config.max_storage)
+        {
             return false;
         }
 
@@ -414,6 +444,9 @@ impl PropagationNode {
         );
         if !matches!(self.storage.insert_message(&stored), Ok(true)) {
             return false;
+        }
+        if self.storage_authoritative {
+            return true;
         }
 
         if let Some(ref dir) = self.storage_path {
@@ -528,6 +561,24 @@ impl PropagationNode {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
+        if self.storage_authoritative {
+            let cutoff = (now - self.config.max_message_age as f64) as i64;
+            loop {
+                match self.storage.remove_messages_stored_before(cutoff, 128) {
+                    Ok(128) => continue,
+                    Ok(_) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to cull expired propagation messages");
+                        break;
+                    }
+                }
+            }
+            self.last_offer_times
+                .retain(|_, last_offer| now <= *last_offer + PN_STAMP_THROTTLE as f64);
+            self.sync_sessions
+                .retain(|_, session| !session.idle_for(SYNC_SESSION_IDLE_TIMEOUT));
+            return;
+        }
         let before_ids = self.store.transient_ids();
         let before = before_ids.len();
         self.store.cull_expired(self.config.max_message_age);
@@ -584,6 +635,17 @@ impl PropagationNode {
         _peer_hash: [u8; 16],
         peer_min_stamp_cost: Option<u8>,
     ) -> Vec<PropagationTransientId> {
+        if self.storage_authoritative {
+            return self
+                .storage_metadata_all()
+                .into_iter()
+                .filter(|metadata| {
+                    peer_min_stamp_cost
+                        .is_none_or(|minimum| metadata.stamp_value >= u16::from(minimum))
+                })
+                .map(|metadata| metadata.transient_id)
+                .collect();
+        }
         match peer_min_stamp_cost {
             Some(min_cost) if min_cost > 0 => self
                 .store
@@ -600,23 +662,68 @@ impl PropagationNode {
         &self,
         handled: &HashSet<PropagationTransientId>,
     ) -> Vec<PropagationTransientId> {
-        self.store
-            .transient_ids()
+        self.create_offer([0; 16], None)
             .into_iter()
             .filter(|id| !handled.contains(id))
             .collect()
     }
 
     pub fn message_count(&self) -> usize {
+        if self.storage_authoritative {
+            return self
+                .storage
+                .message_store_stats()
+                .map(|stats| stats.count)
+                .unwrap_or(0);
+        }
         self.store.len()
     }
 
     pub fn total_size(&self) -> usize {
+        if self.storage_authoritative {
+            return self
+                .storage
+                .message_store_stats()
+                .map(|stats| stats.payload_size)
+                .unwrap_or(0);
+        }
         self.store.total_size()
     }
 
     pub fn contains(&self, transient_id: &PropagationTransientId) -> bool {
+        if self.storage_authoritative {
+            return self
+                .storage
+                .message_metadata(transient_id)
+                .ok()
+                .flatten()
+                .is_some();
+        }
         self.store.contains(transient_id)
+    }
+
+    fn storage_metadata_all(&self) -> Vec<crate::storage::StoredMessageMetadata> {
+        const PAGE_SIZE: usize = 256;
+        let mut all = Vec::new();
+        let mut cursor = None;
+        loop {
+            let Ok(page) = self
+                .storage
+                .message_metadata_page(cursor.as_ref(), PAGE_SIZE)
+            else {
+                break;
+            };
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|metadata| metadata.transient_id);
+            let done = page.len() < PAGE_SIZE;
+            all.extend(page);
+            if done {
+                break;
+            }
+        }
+        all
     }
 
     pub fn get_session(&self, peer_hash: &[u8; 16]) -> Option<&SyncSession> {
@@ -657,8 +764,7 @@ impl PropagationNode {
     ) -> Vec<PropagationTransientId> {
         let peer_has: HashSet<PropagationTransientId> = offered_ids.iter().copied().collect();
 
-        self.store
-            .transient_ids()
+        self.create_offer([0; 16], None)
             .into_iter()
             .filter(|id| !peer_has.contains(id))
             .collect()
@@ -694,7 +800,7 @@ impl PropagationNode {
 
         let wanted: Vec<PropagationTransientId> = offered_ids
             .iter()
-            .filter(|id| !self.store.contains(id))
+            .filter(|id| !self.contains(id))
             .copied()
             .collect();
 
@@ -861,11 +967,25 @@ impl PropagationNode {
 
         if wants_is_nil && haves_is_nil {
             // Phase 1: list available messages for this client, smallest first.
-            let mut available = self.store.entries_for_destination(client_dest_hash);
-            available.sort_by_key(|e| e.size);
+            let mut available: Vec<(PropagationTransientId, usize)> = if self.storage_authoritative
+            {
+                self.storage
+                    .message_metadata_for_destination(client_dest_hash, None, usize::MAX)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|metadata| (metadata.transient_id, metadata.payload_size))
+                    .collect()
+            } else {
+                self.store
+                    .entries_for_destination(client_dest_hash)
+                    .into_iter()
+                    .map(|entry| (entry.transient_id, entry.size))
+                    .collect()
+            };
+            available.sort_by_key(|(_, size)| *size);
             let id_list: Vec<Value> = available
                 .iter()
-                .map(|e| Value::Binary(e.transient_id.to_vec()))
+                .map(|(transient_id, _)| Value::Binary(transient_id.to_vec()))
                 .collect();
             GetRequestAction::Respond(crate::encode_value(&Value::Array(id_list)))
         } else if wants_is_nil && !haves_is_nil {
@@ -894,17 +1014,25 @@ impl PropagationNode {
             let mut reads = Vec::new();
             if let Some(wants_arr) = arr[0].as_array() {
                 for want_val in wants_arr {
-                    if let Some(tid) = parse_store_id(want_val)
-                        && let Some(ref dir) = self.storage_path
-                        && let Some(entry) = self.store.get(&tid)
-                        // Ownership gate (Python LXMRouter.py:1479): a client
-                        // may only download messages addressed to itself.
-                        && entry.destination_hash == *client_dest_hash
-                    {
-                        reads.push(PlannedRead {
-                            path: dir.join(entry.filename()),
-                            stamped: entry.stamped,
-                        });
+                    if let Some(tid) = parse_store_id(want_val) {
+                        if let Some(ref dir) = self.storage_path
+                            && let Some(entry) = self.store.get(&tid)
+                            && entry.destination_hash == *client_dest_hash
+                        {
+                            reads.push(PlannedRead {
+                                source: PlannedReadSource::File(dir.join(entry.filename())),
+                                stamped: entry.stamped,
+                            });
+                        } else if self.storage_authoritative
+                            && let Ok(Some(metadata)) = self.storage.message_metadata(&tid)
+                            && metadata.destination_hash == *client_dest_hash
+                            && let Ok(Some(payload)) = self.storage.message_payload(&tid)
+                        {
+                            reads.push(PlannedRead {
+                                source: PlannedReadSource::Payload(payload),
+                                stamped: metadata.stamped,
+                            });
+                        }
                     }
                 }
             }
@@ -924,10 +1052,17 @@ impl PropagationNode {
     /// addressed to that client (Python LXMRouter.py:1454 ownership gate);
     /// foreign transient IDs are ignored.
     fn purge_client_entry(&mut self, tid: &PropagationTransientId, client_dest_hash: &[u8; 16]) {
-        let owned = self
-            .store
-            .get(tid)
-            .is_some_and(|entry| entry.destination_hash == *client_dest_hash);
+        let owned = if self.storage_authoritative {
+            self.storage
+                .message_metadata(tid)
+                .ok()
+                .flatten()
+                .is_some_and(|metadata| metadata.destination_hash == *client_dest_hash)
+        } else {
+            self.store
+                .get(tid)
+                .is_some_and(|entry| entry.destination_hash == *client_dest_hash)
+        };
         if !owned {
             return;
         }
@@ -971,6 +1106,18 @@ impl PropagationNode {
         &self,
         requested_ids: &[PropagationTransientId],
     ) -> Vec<(PropagationTransientId, Vec<u8>)> {
+        if self.storage_authoritative {
+            return requested_ids
+                .iter()
+                .filter_map(|transient_id| {
+                    self.storage
+                        .message_payload(transient_id)
+                        .ok()
+                        .flatten()
+                        .map(|payload| (*transient_id, payload))
+                })
+                .collect();
+        }
         read_planned_messages(&self.plan_message_reads(requested_ids))
     }
 
@@ -995,9 +1142,9 @@ impl PropagationNode {
     /// Compare a peer's `SyncOffer` against our store and return a `SyncGet`
     /// listing IDs we want. Python reference: LXMRouter.offer_request_received().
     pub fn process_sync_offer(&mut self, peer_hash: [u8; 16], offer: &SyncOffer) -> SyncGet {
-        // process_offer needs &self.store; compute the get before mutating sync_sessions.
         let mut tmp_session = SyncSession::new(peer_hash);
-        let result = tmp_session.process_offer(offer, &self.store);
+        let result =
+            tmp_session.process_offer_with(offer, |transient_id| self.contains(transient_id));
         self.sync_sessions.insert(peer_hash, tmp_session);
         result
     }
@@ -1027,7 +1174,7 @@ impl PropagationNode {
             })
             .collect();
 
-        read_planned_messages(&self.plan_message_reads(&wanted))
+        self.message_get_request(&wanted)
             .into_iter()
             .map(|(_tid, data)| data)
             .collect()
@@ -1098,7 +1245,7 @@ impl PropagationNode {
     /// through on every sync — grow with total propagated volume forever.
     /// Files converge lazily: the next `mark_peer_handled` saves the pruned set.
     fn prune_handled_against_store(&self, peer: &mut LxmPeer) {
-        peer.handled_messages.retain(|id| self.store.contains(id));
+        peer.handled_messages.retain(|id| self.contains(id));
     }
 }
 
@@ -1106,8 +1253,8 @@ impl std::fmt::Debug for PropagationNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PropagationNode")
             .field("dest_hash", &hex_encode(&self.dest_hash))
-            .field("message_count", &self.store.len())
-            .field("total_size", &self.store.total_size())
+            .field("message_count", &self.message_count())
+            .field("total_size", &self.total_size())
             .field("sessions", &self.sync_sessions.len())
             .field("storage_path", &self.storage_path)
             .finish()
@@ -1645,6 +1792,43 @@ mod tests {
 
         let loaded = node.load_peers();
         assert!(loaded.is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_backed_node_recovers_offers_and_payload_after_restart() {
+        use crate::storage::spawn_sqlite_storage_actor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("propagation.sqlite");
+        let destination_hash = [0x77; 16];
+        let mut payload = destination_hash.to_vec();
+        payload.extend_from_slice(b"opaque encrypted payload");
+        let transient_id = rns_crypto::sha::full_hash(&payload);
+
+        {
+            let handle = spawn_sqlite_storage_actor(database.clone()).unwrap();
+            let mut node = PropagationNode::with_storage_backend(
+                PropagationNodeConfig::default(),
+                [0x55; 16],
+                Box::new(handle),
+            );
+            assert!(node.accept_propagated_blob(&payload, 8));
+            assert_eq!(node.message_count(), 1);
+        }
+
+        let handle = spawn_sqlite_storage_actor(database).unwrap();
+        let node = PropagationNode::with_storage_backend(
+            PropagationNodeConfig::default(),
+            [0x55; 16],
+            Box::new(handle),
+        );
+        assert!(node.contains(&transient_id));
+        assert_eq!(node.create_offer([0; 16], None), vec![transient_id]);
+        assert_eq!(
+            node.message_get_request(&[transient_id]),
+            vec![(transient_id, payload)]
+        );
     }
 
     #[test]
