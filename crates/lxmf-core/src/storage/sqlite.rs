@@ -557,6 +557,61 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_message_insert_leaves_no_partial_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("interrupted.sqlite");
+        drop(SqliteStorage::open(&path).unwrap());
+
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO messages(
+                     transient_id, message_hash, destination_hash, stored_at,
+                     stamp_value, payload, payload_size, collected, stamped
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    [0x11_u8; 32].as_slice(),
+                    [0x22_u8; 32].as_slice(),
+                    [0x33_u8; 16].as_slice(),
+                    100_i64,
+                    0_i64,
+                    [0x44_u8; 64].as_slice(),
+                    64_i64,
+                    0_i64,
+                    0_i64,
+                ],
+            )
+            .unwrap();
+        // Simulate interruption before COMMIT. Dropping the transaction must
+        // roll it back, leaving neither metadata nor payload visible.
+        drop(transaction);
+        drop(connection);
+
+        let mut storage = SqliteStorage::open(&path).unwrap();
+        assert_eq!(
+            storage.message_store_stats().unwrap(),
+            MessageStoreStats::default()
+        );
+        assert!(storage.message_metadata(&[0x11; 32]).unwrap().is_none());
+        assert!(storage.message_payload(&[0x11; 32]).unwrap().is_none());
+
+        assert!(
+            storage
+                .insert_message(&StoredMessage::new(
+                    [0x11; 32],
+                    [0x22; 32],
+                    [0x33; 16],
+                    100,
+                    0,
+                    vec![0x44; 64],
+                    false,
+                ))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn applies_low_memory_pragmas() {
         let directory = tempfile::tempdir().unwrap();
         let storage = SqliteStorage::open(&directory.path().join("pragmas.sqlite")).unwrap();
