@@ -45,9 +45,7 @@ use lxmf_tools::lxmd_runtime::{
 use rns_identity::announce::AnnounceData;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
-use rns_identity::ratchet::{
-    ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
-};
+use rns_identity::ratchet::{ReceivedRatchet, purge_expired_ratchets_in_memory};
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_transport::messages::{
     AnnounceHandlerEvent, TransportMessage, TransportQuery, TransportQueryResponse,
@@ -310,7 +308,7 @@ fn create_propagation_announce_packet_for(
 /// store via Transport's known-destinations cleanup; lxmd has no last-use
 /// signal, so over the cap it evicts entries without a live ratchet first,
 /// then oldest-ratchet entries. Evicted keys re-learn from the next announce.
-const KNOWN_IDENTITIES_SOFT_CAP: usize = 10_000;
+const KNOWN_IDENTITIES_SOFT_CAP: usize = 512;
 
 /// Full path-table resync cadence for `route_hops`. Announce events keep the
 /// map fresh in between; this only re-baselines and prunes expired paths.
@@ -366,6 +364,22 @@ fn prune_known_identities(
         }
     }
     before - known_identities.len()
+}
+
+fn prune_received_ratchets(cache: &mut HashMap<String, ReceivedRatchet>) -> usize {
+    if cache.len() <= KNOWN_IDENTITIES_SOFT_CAP {
+        return 0;
+    }
+    let before = cache.len();
+    let mut oldest = cache
+        .iter()
+        .map(|(key, value)| (key.clone(), value.received_at))
+        .collect::<Vec<_>>();
+    oldest.sort_by(|left, right| left.1.total_cmp(&right.1));
+    for (key, _) in oldest.into_iter().take(before - KNOWN_IDENTITIES_SOFT_CAP) {
+        cache.remove(&key);
+    }
+    before - cache.len()
 }
 
 fn send_propagation_announce_try(
@@ -445,6 +459,25 @@ struct LxmdRunner {
 }
 
 impl LxmdRunner {
+    fn lookup_identity_hex(&self, hash_hex: &str) -> Option<[u8; 64]> {
+        self.known_identities.get(hash_hex).copied().or_else(|| {
+            let bytes = hex::decode(hash_hex).ok()?;
+            let hash: [u8; 16] = bytes.try_into().ok()?;
+            self.router.identity(&hash)
+        })
+    }
+
+    fn lookup_ratchet_hex(&self, hash_hex: &str) -> Option<ReceivedRatchet> {
+        self.received_ratchets.get(hash_hex).copied().or_else(|| {
+            let bytes = hex::decode(hash_hex).ok()?;
+            let hash: [u8; 16] = bytes.try_into().ok()?;
+            let stored = self.router.received_ratchet(&hash)?;
+            Some(ReceivedRatchet::new_at(
+                stored.ratchet_key,
+                stored.received_at,
+            ))
+        })
+    }
     fn new(
         config: DaemonConfig,
         config_dir: &Path,
@@ -491,53 +524,30 @@ impl LxmdRunner {
             wall_now,
         )?;
 
-        // Mirrors Python `Identity._clean_ratchets()`: sweep the directory at
-        // startup so stale entries don't survive a restart.
         let received_dir = paths.received_ratchets_dir.clone();
-        std::fs::create_dir_all(&received_dir)?;
-        let removed = clean_received_ratchets_dir(&received_dir);
-        if removed > 0 {
-            tracing::info!(removed, "swept expired received-ratchet files at startup");
-        }
         let mut received_ratchets = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&received_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_stem().and_then(|n| n.to_str())
-                    && let Ok(rr) = ReceivedRatchet::load(&path)
-                {
-                    received_ratchets.insert(name.to_string(), rr);
-                }
-            }
-        }
-
-        // known_identities format: concat of [dest_hash:16][pubkey:64]
-        let ki_path = paths.known_identities_path.clone();
         let mut known_identities: HashMap<String, [u8; 64]> = HashMap::new();
-        if ki_path.exists()
-            && let Ok(data) = std::fs::read(&ki_path)
-        {
-            let mut pos = 0;
-            while pos + 80 <= data.len() {
-                let mut dh = [0u8; 16];
-                dh.copy_from_slice(&data[pos..pos + 16]);
-                let mut pk = [0u8; 64];
-                pk.copy_from_slice(&data[pos + 16..pos + 80]);
-                known_identities.insert(hex::encode(dh), pk);
-                pos += 80;
-            }
-        }
 
+        std::fs::create_dir_all(&paths.lxmf_storage_dir)?;
+        let (mut router, storage) =
+            create_router_with_sqlite(&config, transport_tx.clone(), &paths.database_path)?;
+        for (hash, public_key) in router.identity_cache_seed(KNOWN_IDENTITIES_SOFT_CAP) {
+            known_identities.insert(hex::encode(hash), public_key);
+        }
+        let ratchet_cutoff = now_f64() - rns_wire::constants::RATCHET_EXPIRY as f64;
+        for stored in router.ratchet_cache_seed(ratchet_cutoff, KNOWN_IDENTITIES_SOFT_CAP) {
+            received_ratchets.insert(
+                hex::encode(stored.destination_hash),
+                ReceivedRatchet::new_at(stored.ratchet_key, stored.received_at),
+            );
+        }
+        router.cull_received_ratchets_before(ratchet_cutoff);
         tracing::info!(
             ratchet_keys = delivery_ratchets.ring().len(),
             received_ratchets = received_ratchets.len(),
             known_identities = known_identities.len(),
-            "Crypto state loaded"
+            "Crypto state loaded from SQLite"
         );
-
-        std::fs::create_dir_all(&paths.lxmf_storage_dir)?;
-        let (router, storage) =
-            create_router_with_sqlite(&config, transport_tx.clone(), &paths.database_path)?;
 
         // LinkManager handles link handshakes (ECDH), keepalive, identification,
         // and resource transfers; it forwards plaintext application data here.
@@ -1397,7 +1407,7 @@ impl LxmdRunner {
                 (
                     dest,
                     DirectDeliveryPlanInput {
-                        identity_known: self.known_identities.contains_key(&hex::encode(dest)),
+                        identity_known: self.lookup_identity_hex(&hex::encode(dest)).is_some(),
                         route: direct_route_snapshot(&self.route_hops, dest),
                         reusable_link: direct_reusable_link_state(
                             self.link_delivery.as_ref(),
@@ -1451,8 +1461,12 @@ impl LxmdRunner {
         let propagation_node_ready = self
             .router
             .outbound_propagation_node
-            .map(|node| self.known_identities.contains_key(&hex::encode(node)))
+            .map(|node| self.lookup_identity_hex(&hex::encode(node)).is_some())
             .unwrap_or(false);
+        let propagation_node_public_key = self
+            .router
+            .outbound_propagation_node
+            .and_then(|node| self.lookup_identity_hex(&hex::encode(node)));
         if let Some(ref mut client) = self.propagation_client {
             client.drain_events(&self.known_identities);
             client.tick();
@@ -1464,11 +1478,7 @@ impl LxmdRunner {
                 && client.state == lxmf_core::propagation_client::PropagationClientState::Idle
             {
                 if propagation_node_ready {
-                    let node = self
-                        .router
-                        .outbound_propagation_node
-                        .expect("checked propagation node");
-                    if let Some(public_key) = self.known_identities.get(&hex::encode(node)).copied()
+                    if let Some(public_key) = propagation_node_public_key
                         && client.start_download_with_public_key(public_key)
                     {
                         self.last_propagation_check = now;
@@ -1563,7 +1573,9 @@ impl LxmdRunner {
         // 15-minute interval matches Python's CLEAN_INTERVAL.
         if now - self.last_ratchet_clean > 900.0 {
             let mem_dropped = purge_expired_ratchets_in_memory(&mut self.received_ratchets);
-            let disk_dropped = clean_received_ratchets_dir(&self.received_ratchets_dir);
+            let disk_dropped = self
+                .router
+                .cull_received_ratchets_before(now - rns_wire::constants::RATCHET_EXPIRY as f64);
             let ids_dropped =
                 prune_known_identities(&mut self.known_identities, &self.received_ratchets);
             if mem_dropped > 0 || disk_dropped > 0 || ids_dropped > 0 {
@@ -1648,6 +1660,12 @@ impl LxmdRunner {
                 && self.known_identities.get(&dest_hex) != Some(&pub_key)
             {
                 self.known_identities.insert(dest_hex.clone(), pub_key);
+                if let Err(error) = self
+                    .router
+                    .remember_identity(event.destination_hash, pub_key)
+                {
+                    tracing::warn!(%error, dest=%dest_hex, "failed to persist identity");
+                }
                 tracing::debug!(dest = %dest_hex, "learned identity key from announce");
             }
             // Python Identity._remember_ratchet: persist only the single
@@ -1661,18 +1679,17 @@ impl LxmdRunner {
             {
                 let rr = ReceivedRatchet::new(ratchet_key);
                 self.received_ratchets.insert(dest_hex.clone(), rr);
+                if let Err(error) = self.router.remember_received_ratchet(
+                    event.destination_hash,
+                    ratchet_key,
+                    rr.received_at,
+                ) {
+                    tracing::warn!(%error, dest=%dest_hex, "failed to persist received ratchet");
+                }
                 tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
-                let path = self
-                    .received_ratchets_dir
-                    .join(format!("{dest_hex}.ratchet"));
-                let dir = self.received_ratchets_dir.clone();
-                tokio::task::spawn_blocking(move || {
-                    std::fs::create_dir_all(&dir).ok();
-                    if let Err(e) = rr.save(&path) {
-                        tracing::warn!("Failed to persist received ratchet: {e}");
-                    }
-                });
             }
+            prune_received_ratchets(&mut self.received_ratchets);
+            prune_known_identities(&mut self.known_identities, &self.received_ratchets);
         }
         seen
     }
@@ -2050,7 +2067,7 @@ impl LxmdRunner {
                 OutboundAction::DeliverPropagated { message, prop_hash } => {
                     let mut message = message;
                     let prop_hex = hex::encode(prop_hash);
-                    if !self.known_identities.contains_key(&prop_hex) {
+                    if self.lookup_identity_hex(&prop_hex).is_none() {
                         tracing::warn!(
                             prop = %prop_hex,
                             attempts = message.delivery_attempts,
@@ -2139,7 +2156,7 @@ impl LxmdRunner {
                     plan_direct_delivery(
                         &mut message,
                         DirectDeliveryPlanInput {
-                            identity_known: self.known_identities.contains_key(&dest_hex),
+                            identity_known: self.lookup_identity_hex(&dest_hex).is_some(),
                             route: direct_route_snapshot(&self.route_hops, dest_hash),
                             reusable_link: direct_reusable_link_state(
                                 self.link_delivery.as_ref(),
@@ -2439,11 +2456,11 @@ impl LxmdRunner {
     }
 
     fn encrypt_for_destination(&self, dest_hash_hex: &str, plaintext: &[u8]) -> Option<Vec<u8>> {
-        let pub_key = self.known_identities.get(dest_hash_hex)?;
-        let remote = Identity::from_public_key(pub_key).ok()?;
-        let ratchet_pub = self
-            .received_ratchets
-            .get(dest_hash_hex)
+        let pub_key = self.lookup_identity_hex(dest_hash_hex)?;
+        let remote = Identity::from_public_key(&pub_key).ok()?;
+        let ratchet = self.lookup_ratchet_hex(dest_hash_hex);
+        let ratchet_pub = ratchet
+            .as_ref()
             .filter(|rr| !rr.is_expired())
             .map(|rr| &rr.ratchet_pub);
         remote.encrypt(plaintext, ratchet_pub).ok()
@@ -2523,30 +2540,6 @@ impl LxmdRunner {
         std::fs::create_dir_all(&ratchet_dir).ok();
 
         self.delivery_ratchets.save(&self.identity);
-
-        let received_dir = ratchet_dir.join("received");
-        std::fs::create_dir_all(&received_dir).ok();
-        for (hash_hex, rr) in &self.received_ratchets {
-            let path = received_dir.join(format!("{hash_hex}.ratchet"));
-            if let Err(e) = rr.save(&path) {
-                tracing::warn!("Failed to save received ratchet {hash_hex}: {e}");
-            }
-        }
-
-        // Flat binary: [dest_hash:16][pub:64] per entry.
-        let ki_path = ratchet_dir.join("known_identities");
-        let mut data = Vec::with_capacity(self.known_identities.len() * 80);
-        for (hash_hex, pk) in &self.known_identities {
-            if let Ok(hash_bytes) = hex::decode(hash_hex)
-                && hash_bytes.len() == 16
-            {
-                data.extend_from_slice(&hash_bytes);
-                data.extend_from_slice(pk);
-            }
-        }
-        if let Err(e) = rns_identity::persistence::atomic_write(&ki_path, &data) {
-            tracing::warn!("Failed to save known identities: {e}");
-        }
     }
 }
 

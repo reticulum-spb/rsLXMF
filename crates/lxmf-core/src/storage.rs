@@ -116,6 +116,26 @@ pub struct StoredOutboundMessage {
     pub encoded_message: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoredStampCost {
+    pub destination_hash: [u8; 16],
+    pub cost: u8,
+    pub recorded_at: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoredIdentity {
+    pub destination_hash: [u8; 16],
+    pub public_key: [u8; 64],
+    pub updated_at: f64,
+}
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoredRatchet {
+    pub destination_hash: [u8; 16],
+    pub ratchet_key: [u8; 32],
+    pub received_at: f64,
+}
+
 /// Synchronous because the router/storage actor owns each implementation.
 pub trait LxmfStorage: Send {
     fn contains_transient_id(
@@ -225,6 +245,31 @@ pub trait LxmfStorage: Send {
     fn remove_outbound_message(&mut self, message_id: &[u8; 32]) -> Result<bool, StorageError>;
 
     fn outbound_count(&self, deferred: Option<bool>) -> Result<usize, StorageError>;
+
+    fn upsert_ticket(&mut self, ticket: &crate::ticket::Ticket) -> Result<(), StorageError>;
+    fn valid_ticket(
+        &self,
+        destination_hash: &[u8; 16],
+        now: f64,
+    ) -> Result<Option<crate::ticket::Ticket>, StorageError>;
+    fn remove_tickets(&mut self, destination_hash: &[u8; 16]) -> Result<usize, StorageError>;
+    fn cull_tickets(&mut self, cutoff: f64) -> Result<usize, StorageError>;
+    fn upsert_stamp_cost(&mut self, entry: StoredStampCost) -> Result<(), StorageError>;
+    fn stamp_cost(
+        &self,
+        destination_hash: &[u8; 16],
+    ) -> Result<Option<StoredStampCost>, StorageError>;
+    fn remove_stamp_cost(&mut self, destination_hash: &[u8; 16]) -> Result<bool, StorageError>;
+    fn cull_stamp_costs_before(&mut self, cutoff: f64) -> Result<usize, StorageError>;
+    fn stamp_cost_count(&self) -> Result<usize, StorageError>;
+    fn upsert_identity(&mut self, identity: StoredIdentity) -> Result<(), StorageError>;
+    fn identity(&self, destination_hash: &[u8; 16])
+    -> Result<Option<StoredIdentity>, StorageError>;
+    fn identity_page(&self, limit: usize) -> Result<Vec<StoredIdentity>, StorageError>;
+    fn upsert_ratchet(&mut self, ratchet: StoredRatchet) -> Result<(), StorageError>;
+    fn ratchet(&self, destination_hash: &[u8; 16]) -> Result<Option<StoredRatchet>, StorageError>;
+    fn ratchet_page(&self, cutoff: f64, limit: usize) -> Result<Vec<StoredRatchet>, StorageError>;
+    fn cull_ratchets_before(&mut self, cutoff: f64) -> Result<usize, StorageError>;
 }
 
 #[derive(Debug, Default)]
@@ -232,6 +277,10 @@ pub struct MemoryStorage {
     transient_ids: HashMap<(TransientIdKind, PropagationTransientId), i64>,
     messages: HashMap<PropagationTransientId, StoredMessage>,
     outbound_messages: HashMap<[u8; 32], StoredOutboundMessage>,
+    tickets: HashMap<[u8; 16], crate::ticket::Ticket>,
+    stamp_costs: HashMap<[u8; 16], StoredStampCost>,
+    identities: HashMap<[u8; 16], StoredIdentity>,
+    ratchets: HashMap<[u8; 16], StoredRatchet>,
 }
 
 impl MemoryStorage {
@@ -524,6 +573,102 @@ impl LxmfStorage for MemoryStorage {
             .filter(|message| deferred.is_none_or(|value| message.metadata.deferred == value))
             .count())
     }
+
+    fn upsert_ticket(&mut self, ticket: &crate::ticket::Ticket) -> Result<(), StorageError> {
+        self.tickets.insert(ticket.token, ticket.clone());
+        Ok(())
+    }
+
+    fn valid_ticket(
+        &self,
+        destination_hash: &[u8; 16],
+        now: f64,
+    ) -> Result<Option<crate::ticket::Ticket>, StorageError> {
+        Ok(self
+            .tickets
+            .values()
+            .find(|ticket| ticket.destination_hash == *destination_hash && ticket.is_valid(now))
+            .cloned())
+    }
+
+    fn remove_tickets(&mut self, destination_hash: &[u8; 16]) -> Result<usize, StorageError> {
+        let before = self.tickets.len();
+        self.tickets
+            .retain(|_, ticket| ticket.destination_hash != *destination_hash);
+        Ok(before - self.tickets.len())
+    }
+
+    fn cull_tickets(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        let before = self.tickets.len();
+        self.tickets
+            .retain(|_, ticket| !ticket.used && ticket.expires >= cutoff);
+        Ok(before - self.tickets.len())
+    }
+
+    fn upsert_stamp_cost(&mut self, entry: StoredStampCost) -> Result<(), StorageError> {
+        self.stamp_costs.insert(entry.destination_hash, entry);
+        Ok(())
+    }
+
+    fn stamp_cost(
+        &self,
+        destination_hash: &[u8; 16],
+    ) -> Result<Option<StoredStampCost>, StorageError> {
+        Ok(self.stamp_costs.get(destination_hash).copied())
+    }
+
+    fn remove_stamp_cost(&mut self, destination_hash: &[u8; 16]) -> Result<bool, StorageError> {
+        Ok(self.stamp_costs.remove(destination_hash).is_some())
+    }
+
+    fn cull_stamp_costs_before(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        let before = self.stamp_costs.len();
+        self.stamp_costs
+            .retain(|_, entry| entry.recorded_at >= cutoff);
+        Ok(before - self.stamp_costs.len())
+    }
+    fn stamp_cost_count(&self) -> Result<usize, StorageError> {
+        Ok(self.stamp_costs.len())
+    }
+    fn upsert_identity(&mut self, identity: StoredIdentity) -> Result<(), StorageError> {
+        self.identities.insert(identity.destination_hash, identity);
+        Ok(())
+    }
+    fn identity(
+        &self,
+        destination_hash: &[u8; 16],
+    ) -> Result<Option<StoredIdentity>, StorageError> {
+        Ok(self.identities.get(destination_hash).copied())
+    }
+    fn identity_page(&self, limit: usize) -> Result<Vec<StoredIdentity>, StorageError> {
+        let mut values = self.identities.values().copied().collect::<Vec<_>>();
+        values.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at));
+        values.truncate(limit);
+        Ok(values)
+    }
+    fn upsert_ratchet(&mut self, ratchet: StoredRatchet) -> Result<(), StorageError> {
+        self.ratchets.insert(ratchet.destination_hash, ratchet);
+        Ok(())
+    }
+    fn ratchet(&self, destination_hash: &[u8; 16]) -> Result<Option<StoredRatchet>, StorageError> {
+        Ok(self.ratchets.get(destination_hash).copied())
+    }
+    fn ratchet_page(&self, cutoff: f64, limit: usize) -> Result<Vec<StoredRatchet>, StorageError> {
+        let mut values = self
+            .ratchets
+            .values()
+            .filter(|r| r.received_at >= cutoff)
+            .copied()
+            .collect::<Vec<_>>();
+        values.sort_by(|a, b| b.received_at.total_cmp(&a.received_at));
+        values.truncate(limit);
+        Ok(values)
+    }
+    fn cull_ratchets_before(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        let before = self.ratchets.len();
+        self.ratchets.retain(|_, r| r.received_at >= cutoff);
+        Ok(before - self.ratchets.len())
+    }
 }
 
 impl StoredOutboundMetadata {
@@ -765,6 +910,64 @@ mod tests {
         assert!(!storage.remove_outbound_message(&[0x41; 32]).unwrap());
     }
 
+    fn ticket_and_stamp_cost_contract(storage: &mut dyn LxmfStorage) {
+        let destination = [0x71; 16];
+        let ticket = crate::ticket::Ticket::new([0x72; 16], destination, 200.0);
+        storage.upsert_ticket(&ticket).unwrap();
+        assert_eq!(
+            storage
+                .valid_ticket(&destination, 100.0)
+                .unwrap()
+                .unwrap()
+                .token,
+            ticket.token
+        );
+        assert!(storage.valid_ticket(&destination, 201.0).unwrap().is_none());
+        assert_eq!(storage.remove_tickets(&destination).unwrap(), 1);
+
+        let entry = StoredStampCost {
+            destination_hash: destination,
+            cost: 9,
+            recorded_at: 100.0,
+        };
+        storage.upsert_stamp_cost(entry).unwrap();
+        assert_eq!(storage.stamp_cost(&destination).unwrap(), Some(entry));
+        assert_eq!(storage.cull_stamp_costs_before(101.0).unwrap(), 1);
+        assert!(storage.stamp_cost(&destination).unwrap().is_none());
+    }
+
+    fn identity_and_ratchet_contract(storage: &mut dyn LxmfStorage) {
+        let identity = StoredIdentity {
+            destination_hash: [0x81; 16],
+            public_key: [0x82; 64],
+            updated_at: 10.0,
+        };
+        storage.upsert_identity(identity).unwrap();
+        assert_eq!(
+            storage.identity(&identity.destination_hash).unwrap(),
+            Some(identity)
+        );
+        assert_eq!(storage.identity_page(1).unwrap(), vec![identity]);
+        let first = StoredRatchet {
+            destination_hash: identity.destination_hash,
+            ratchet_key: [0x83; 32],
+            received_at: 20.0,
+        };
+        storage.upsert_ratchet(first).unwrap();
+        let replacement = StoredRatchet {
+            ratchet_key: [0x84; 32],
+            received_at: 30.0,
+            ..first
+        };
+        storage.upsert_ratchet(replacement).unwrap();
+        assert_eq!(
+            storage.ratchet(&identity.destination_hash).unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(storage.ratchet_page(25.0, 1).unwrap(), vec![replacement]);
+        assert_eq!(storage.cull_ratchets_before(31.0).unwrap(), 1);
+    }
+
     #[test]
     fn memory_storage_contract() {
         let mut storage = MemoryStorage::new();
@@ -774,6 +977,9 @@ mod tests {
         weighted_culling_contract(&mut weighted_storage);
         let mut outbound_storage = MemoryStorage::new();
         outbound_contract(&mut outbound_storage);
+        let mut durable_state = MemoryStorage::new();
+        ticket_and_stamp_cost_contract(&mut durable_state);
+        identity_and_ratchet_contract(&mut durable_state);
     }
 
     #[cfg(feature = "sqlite")]
@@ -790,6 +996,10 @@ mod tests {
         let outbound_path = directory.path().join("outbound.sqlite");
         let mut outbound_storage = SqliteStorage::open(&outbound_path).unwrap();
         outbound_contract(&mut outbound_storage);
+        let durable_path = directory.path().join("durable-state.sqlite");
+        let mut durable_state = SqliteStorage::open(&durable_path).unwrap();
+        ticket_and_stamp_cost_contract(&mut durable_state);
+        identity_and_ratchet_contract(&mut durable_state);
 
         storage
             .upsert_transient_id(TransientIdKind::LocallyDelivered, [0x44; 32], 300)
@@ -801,7 +1011,7 @@ mod tests {
                 .contains_transient_id(TransientIdKind::LocallyDelivered, &[0x44; 32])
                 .unwrap()
         );
-        assert_eq!(reopened.schema_version().unwrap(), 3);
+        assert_eq!(reopened.schema_version().unwrap(), 5);
         assert_eq!(reopened.message_store_stats().unwrap().count, 1);
     }
 }

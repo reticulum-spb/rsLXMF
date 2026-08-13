@@ -15,8 +15,8 @@ use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::stamper;
 use crate::storage::{
-    LxmfStorage, MemoryStorage, StorageError, StoredMessageMetadata, StoredOutboundMessage,
-    StoredOutboundMetadata, TransientIdKind,
+    LxmfStorage, MemoryStorage, StorageError, StoredIdentity, StoredMessageMetadata,
+    StoredOutboundMessage, StoredOutboundMetadata, StoredRatchet, StoredStampCost, TransientIdKind,
 };
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
@@ -425,6 +425,56 @@ impl LxmRouter {
         router
     }
 
+    pub fn remember_identity(
+        &mut self,
+        destination_hash: [u8; 16],
+        public_key: [u8; 64],
+    ) -> Result<(), StorageError> {
+        self.storage.upsert_identity(StoredIdentity {
+            destination_hash,
+            public_key,
+            updated_at: now_f64(),
+        })
+    }
+    pub fn identity(&self, destination_hash: &[u8; 16]) -> Option<[u8; 64]> {
+        self.storage
+            .identity(destination_hash)
+            .ok()
+            .flatten()
+            .map(|i| i.public_key)
+    }
+    pub fn identity_cache_seed(&self, limit: usize) -> Vec<([u8; 16], [u8; 64])> {
+        self.storage
+            .identity_page(limit)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| (i.destination_hash, i.public_key))
+            .collect()
+    }
+    pub fn remember_received_ratchet(
+        &mut self,
+        destination_hash: [u8; 16],
+        ratchet_key: [u8; 32],
+        received_at: f64,
+    ) -> Result<(), StorageError> {
+        self.storage.upsert_ratchet(StoredRatchet {
+            destination_hash,
+            ratchet_key,
+            received_at,
+        })
+    }
+    pub fn received_ratchet(&self, h: &[u8; 16]) -> Option<StoredRatchet> {
+        self.storage.ratchet(h).ok().flatten()
+    }
+    pub fn ratchet_cache_seed(&self, cutoff: f64, limit: usize) -> Vec<StoredRatchet> {
+        self.storage.ratchet_page(cutoff, limit).unwrap_or_default()
+    }
+    pub fn cull_received_ratchets_before(&mut self, cutoff: f64) -> usize {
+        self.storage
+            .cull_ratchets_before(cutoff)
+            .unwrap_or_default()
+    }
+
     fn persist_outbound_message(&mut self, message: &LxMessage, deferred: bool) -> bool {
         let Some(message_id) = message.message_id.or(message.hash) else {
             tracing::error!("cannot persist outbound message without message ID");
@@ -760,10 +810,20 @@ impl LxmRouter {
         }
 
         let now = now_f64();
-        if message.outbound_ticket.is_none()
-            && let Some(ticket) = self.ticket_store.find(&message.destination_hash, now)
-        {
-            message.outbound_ticket = Some(ticket.token);
+        if message.outbound_ticket.is_none() {
+            let ticket = if self.storage_authoritative {
+                self.storage
+                    .valid_ticket(&message.destination_hash, now)
+                    .ok()
+                    .flatten()
+            } else {
+                self.ticket_store
+                    .find(&message.destination_hash, now)
+                    .cloned()
+            };
+            if let Some(ticket) = ticket {
+                message.outbound_ticket = Some(ticket.token);
+            }
         }
 
         if message.stamp.is_none() && message.stamp_cost.is_none() {
@@ -1081,8 +1141,12 @@ impl LxmRouter {
         let mut token = [0u8; TICKET_LENGTH];
         rand::thread_rng().fill_bytes(&mut token);
         let expires = now_f64() + expiry_secs.unwrap_or(TICKET_EXPIRY) as f64;
-        self.ticket_store
-            .add(Ticket::new(token, destination_hash, expires));
+        let ticket = Ticket::new(token, destination_hash, expires);
+        if self.storage_authoritative {
+            let _ = self.storage.upsert_ticket(&ticket);
+        } else {
+            self.ticket_store.add(ticket);
+        }
         token
     }
 
@@ -1090,12 +1154,22 @@ impl LxmRouter {
     ///
     /// Python reference: `LXMRouter.remember_ticket` — LXMRouter.py:1110-1113.
     pub fn remember_ticket(&mut self, destination_hash: [u8; 16], token: [u8; 16], expires: f64) {
-        self.ticket_store
-            .add(Ticket::new(token, destination_hash, expires));
+        let ticket = Ticket::new(token, destination_hash, expires);
+        if self.storage_authoritative {
+            let _ = self.storage.upsert_ticket(&ticket);
+        } else {
+            self.ticket_store.add(ticket);
+        }
     }
 
     pub fn remove_tickets(&mut self, destination_hash: &[u8; 16]) -> usize {
-        self.ticket_store.remove_destination(destination_hash)
+        if self.storage_authoritative {
+            self.storage
+                .remove_tickets(destination_hash)
+                .unwrap_or_default()
+        } else {
+            self.ticket_store.remove_destination(destination_hash)
+        }
     }
 
     /// Returns the token of the first valid ticket for `destination_hash`.
@@ -1103,9 +1177,17 @@ impl LxmRouter {
     /// Python reference: `LXMRouter.get_outbound_ticket` — LXMRouter.py:1058-1064.
     pub fn get_outbound_ticket(&self, destination_hash: &[u8; 16]) -> Option<[u8; 16]> {
         let now = now_f64();
-        self.ticket_store
-            .find(destination_hash, now)
-            .map(|t| t.token)
+        if self.storage_authoritative {
+            self.storage
+                .valid_ticket(destination_hash, now)
+                .ok()
+                .flatten()
+                .map(|ticket| ticket.token)
+        } else {
+            self.ticket_store
+                .find(destination_hash, now)
+                .map(|ticket| ticket.token)
+        }
     }
 
     /// Returns the expiry (Unix epoch seconds) of the valid ticket for `destination_hash`.
@@ -1113,9 +1195,17 @@ impl LxmRouter {
     /// Python reference: `LXMRouter.get_outbound_ticket_expiry` — LXMRouter.py:1125-1131.
     pub fn get_outbound_ticket_expiry(&self, destination_hash: &[u8; 16]) -> Option<f64> {
         let now = now_f64();
-        self.ticket_store
-            .find(destination_hash, now)
-            .map(|t| t.expires)
+        if self.storage_authoritative {
+            self.storage
+                .valid_ticket(destination_hash, now)
+                .ok()
+                .flatten()
+                .map(|ticket| ticket.expires)
+        } else {
+            self.ticket_store
+                .find(destination_hash, now)
+                .map(|ticket| ticket.expires)
+        }
     }
 
     /// Snapshot of all stored tickets (including expired / used entries).
@@ -1396,6 +1486,9 @@ impl LxmRouter {
     /// Load legacy persisted stamp costs and tickets from `state_dir`.
     /// Transient IDs are exclusively owned by [`LxmfStorage`].
     pub fn load_state(&mut self, state_dir: &std::path::Path) -> std::io::Result<()> {
+        if self.storage_authoritative {
+            return Ok(());
+        }
         use crate::persist;
         self.outbound_stamp_costs = persist::load_stamp_costs(state_dir)?;
         self.ticket_store
@@ -1411,6 +1504,9 @@ impl LxmRouter {
     /// Persist runtime state to `state_dir` using MessagePack. Safe to call
     /// periodically; each file is written atomically via rename.
     pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
+        if self.storage_authoritative {
+            return Ok(());
+        }
         use crate::persist;
 
         persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
@@ -1508,6 +1604,11 @@ impl LxmRouter {
 
     /// Get a cached outbound stamp cost, or `None` if missing or expired.
     pub fn get_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<u8> {
+        if self.storage_authoritative {
+            let entry = self.storage.stamp_cost(destination_hash).ok().flatten()?;
+            return (now_f64() - entry.recorded_at < STAMP_COST_EXPIRY as f64)
+                .then_some(entry.cost);
+        }
         let entry = self.outbound_stamp_costs.get(destination_hash)?;
         let now = now_f64();
         if now - entry.recorded_at < STAMP_COST_EXPIRY as f64 {
@@ -1519,6 +1620,14 @@ impl LxmRouter {
 
     pub fn set_stamp_cost(&mut self, destination_hash: [u8; 16], cost: u8) {
         let now = now_f64();
+        if self.storage_authoritative {
+            let _ = self.storage.upsert_stamp_cost(StoredStampCost {
+                destination_hash,
+                cost,
+                recorded_at: now,
+            });
+            return;
+        }
         self.outbound_stamp_costs.insert(
             destination_hash,
             StampCostEntry {
@@ -1529,7 +1638,13 @@ impl LxmRouter {
     }
 
     pub fn remove_stamp_cost(&mut self, destination_hash: &[u8; 16]) -> bool {
-        self.outbound_stamp_costs.remove(destination_hash).is_some()
+        if self.storage_authoritative {
+            self.storage
+                .remove_stamp_cost(destination_hash)
+                .unwrap_or(false)
+        } else {
+            self.outbound_stamp_costs.remove(destination_hash).is_some()
+        }
     }
 
     pub fn set_propagation_enabled(&mut self, enabled: bool) {
@@ -2164,6 +2279,13 @@ impl LxmRouter {
 
     pub fn cull_stamp_costs(&mut self) {
         let now = now_f64();
+        if self.storage_authoritative {
+            let _ = self
+                .storage
+                .cull_stamp_costs_before(now - STAMP_COST_EXPIRY as f64);
+            let _ = self.storage.cull_tickets(now - TICKET_GRACE as f64);
+            return;
+        }
         self.outbound_stamp_costs
             .retain(|_, e| now - e.recorded_at < STAMP_COST_EXPIRY as f64);
     }
@@ -2340,7 +2462,11 @@ impl LxmRouter {
             peers: self.peers.len(),
             propagation_entries: self.propagation_store.len(),
             propagation_size: self.propagation_store.total_size(),
-            stamp_costs_cached: self.outbound_stamp_costs.len(),
+            stamp_costs_cached: if self.storage_authoritative {
+                self.storage.stamp_cost_count().unwrap_or_default()
+            } else {
+                self.outbound_stamp_costs.len()
+            },
         }
     }
 }
@@ -2592,6 +2718,31 @@ mod tests {
         assert!(router.outbound_summaries(8).len() <= 8);
         assert!(router.process_outbound().is_empty());
         assert!(router.pending_outbound.is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_tickets_and_stamp_costs_survive_restart() {
+        use crate::storage::spawn_sqlite_storage_actor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("delivery-state.sqlite");
+        let destination = [0xD1; 16];
+        let token = [0xE1; 16];
+        {
+            let storage = spawn_sqlite_storage_actor(path.clone()).unwrap();
+            let mut router =
+                LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage);
+            router.remember_ticket(destination, token, now_f64() + 3_600.0);
+            router.set_stamp_cost(destination, 12);
+            assert!(router.ticket_store.all().is_empty());
+            assert!(router.outbound_stamp_costs.is_empty());
+        }
+
+        let storage = spawn_sqlite_storage_actor(path).unwrap();
+        let router = LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage);
+        assert_eq!(router.get_outbound_ticket(&destination), Some(token));
+        assert_eq!(router.get_stamp_cost(&destination), Some(12));
     }
 
     fn direct_policy_message() -> LxMessage {

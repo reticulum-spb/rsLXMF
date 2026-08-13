@@ -237,16 +237,18 @@
 
 ## 9. Остальное долговременное состояние
 
-- [ ] Измерить вклад `known_identities`.
-- [ ] При необходимости перенести identities в SQLite.
-- [ ] Добавить ограниченный LRU identities с настраиваемым размером.
-- [ ] Измерить вклад `received_ratchets`.
-- [ ] При необходимости перенести received ratchets.
-- [ ] Гарантировать атомарную замену ratchet.
-- [ ] Перенести tickets.
-- [ ] Перенести outbound stamp costs.
-- [ ] Проверить необходимость переноса peer metadata.
-- [ ] Не переносить активное состояние link/session в SQLite.
+- [ ] Измерить вклад `known_identities` на накопленном production-состоянии.
+- [x] Перенести identities в SQLite.
+- [x] Добавить ограниченный hot cache identities/ratchets (512 записей);
+  конфигурируемый размер вынести в конфигурацию на этапе настройки памяти.
+- [ ] Измерить вклад `received_ratchets` на накопленном production-состоянии.
+- [x] Перенести received ratchets в SQLite.
+- [x] Гарантировать атомарную замену ratchet в SQLite через UPSERT.
+- [x] Перенести tickets.
+- [x] Перенести outbound stamp costs.
+- [x] Проверить необходимость переноса peer metadata: пока не требуется;
+  bounded числом configured/max peers и не является источником роста.
+- [x] Не переносить активное состояние link/session в SQLite.
 
 ## 10. Ограничение дискового пространства и обслуживание
 

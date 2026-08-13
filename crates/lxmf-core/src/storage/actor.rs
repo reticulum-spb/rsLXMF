@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex, mpsc};
 
 use super::{
-    LxmfStorage, MessageStoreStats, StorageError, StoredMessage, StoredMessageMetadata,
-    StoredOutboundMessage, StoredOutboundMetadata, TransientIdKind,
+    LxmfStorage, MessageStoreStats, StorageError, StoredIdentity, StoredMessage,
+    StoredMessageMetadata, StoredOutboundMessage, StoredOutboundMetadata, StoredRatchet,
+    StoredStampCost, TransientIdKind,
 };
 use crate::types::PropagationTransientId;
 
@@ -288,6 +289,69 @@ impl LxmfStorage for StorageHandle {
 
     fn outbound_count(&self, deferred: Option<bool>) -> Result<usize, StorageError> {
         self.call(move |storage| storage.outbound_count(deferred))
+    }
+
+    fn upsert_ticket(&mut self, ticket: &crate::ticket::Ticket) -> Result<(), StorageError> {
+        let ticket = ticket.clone();
+        self.call(move |storage| storage.upsert_ticket(&ticket))
+    }
+    fn valid_ticket(
+        &self,
+        destination_hash: &[u8; 16],
+        now: f64,
+    ) -> Result<Option<crate::ticket::Ticket>, StorageError> {
+        let destination_hash = *destination_hash;
+        self.call(move |storage| storage.valid_ticket(&destination_hash, now))
+    }
+    fn remove_tickets(&mut self, destination_hash: &[u8; 16]) -> Result<usize, StorageError> {
+        let destination_hash = *destination_hash;
+        self.call(move |storage| storage.remove_tickets(&destination_hash))
+    }
+    fn cull_tickets(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        self.call(move |storage| storage.cull_tickets(cutoff))
+    }
+    fn upsert_stamp_cost(&mut self, entry: StoredStampCost) -> Result<(), StorageError> {
+        self.call(move |storage| storage.upsert_stamp_cost(entry))
+    }
+    fn stamp_cost(
+        &self,
+        destination_hash: &[u8; 16],
+    ) -> Result<Option<StoredStampCost>, StorageError> {
+        let destination_hash = *destination_hash;
+        self.call(move |storage| storage.stamp_cost(&destination_hash))
+    }
+    fn remove_stamp_cost(&mut self, destination_hash: &[u8; 16]) -> Result<bool, StorageError> {
+        let destination_hash = *destination_hash;
+        self.call(move |storage| storage.remove_stamp_cost(&destination_hash))
+    }
+    fn cull_stamp_costs_before(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        self.call(move |storage| storage.cull_stamp_costs_before(cutoff))
+    }
+    fn stamp_cost_count(&self) -> Result<usize, StorageError> {
+        self.call(|storage| storage.stamp_cost_count())
+    }
+    fn upsert_identity(&mut self, identity: StoredIdentity) -> Result<(), StorageError> {
+        self.call(move |s| s.upsert_identity(identity))
+    }
+    fn identity(&self, hash: &[u8; 16]) -> Result<Option<StoredIdentity>, StorageError> {
+        let hash = *hash;
+        self.call(move |s| s.identity(&hash))
+    }
+    fn identity_page(&self, limit: usize) -> Result<Vec<StoredIdentity>, StorageError> {
+        self.call(move |s| s.identity_page(limit))
+    }
+    fn upsert_ratchet(&mut self, ratchet: StoredRatchet) -> Result<(), StorageError> {
+        self.call(move |s| s.upsert_ratchet(ratchet))
+    }
+    fn ratchet(&self, hash: &[u8; 16]) -> Result<Option<StoredRatchet>, StorageError> {
+        let hash = *hash;
+        self.call(move |s| s.ratchet(&hash))
+    }
+    fn ratchet_page(&self, cutoff: f64, limit: usize) -> Result<Vec<StoredRatchet>, StorageError> {
+        self.call(move |s| s.ratchet_page(cutoff, limit))
+    }
+    fn cull_ratchets_before(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        self.call(move |s| s.cull_ratchets_before(cutoff))
     }
 }
 

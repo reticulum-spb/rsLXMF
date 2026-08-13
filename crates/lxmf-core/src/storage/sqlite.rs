@@ -3,12 +3,13 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 
 use super::{
-    LxmfStorage, MessageStoreStats, StorageError, StoredMessage, StoredMessageMetadata,
-    StoredOutboundMessage, StoredOutboundMetadata, TransientIdKind, validate_message,
+    LxmfStorage, MessageStoreStats, StorageError, StoredIdentity, StoredMessage,
+    StoredMessageMetadata, StoredOutboundMessage, StoredOutboundMetadata, StoredRatchet,
+    StoredStampCost, TransientIdKind, validate_message,
 };
 use crate::types::PropagationTransientId;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 5;
 
 pub struct SqliteStorage {
     connection: Connection,
@@ -520,6 +521,125 @@ impl LxmfStorage for SqliteStorage {
         };
         i64_to_usize(count, "outbound count")
     }
+
+    fn upsert_ticket(&mut self, ticket: &crate::ticket::Ticket) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO tickets(token, destination_hash, expires, used) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(token) DO UPDATE SET destination_hash=excluded.destination_hash, expires=excluded.expires, used=excluded.used",
+            params![ticket.token.as_slice(), ticket.destination_hash.as_slice(), ticket.expires, i64::from(ticket.used)],
+        ).map(|_| ()).map_err(database_error)
+    }
+    fn valid_ticket(
+        &self,
+        destination_hash: &[u8; 16],
+        now: f64,
+    ) -> Result<Option<crate::ticket::Ticket>, StorageError> {
+        self.connection.query_row(
+            "SELECT token, destination_hash, expires, used FROM tickets WHERE destination_hash=?1 AND used=0 AND expires>?2 ORDER BY expires LIMIT 1",
+            params![destination_hash.as_slice(), now], |row| Ok(crate::ticket::Ticket { token: fixed_blob(row.get(0)?, 0)?, destination_hash: fixed_blob(row.get(1)?, 1)?, expires: row.get(2)?, used: row.get::<_, i64>(3)? != 0 })
+        ).optional().map_err(database_error)
+    }
+    fn remove_tickets(&mut self, destination_hash: &[u8; 16]) -> Result<usize, StorageError> {
+        self.connection
+            .execute(
+                "DELETE FROM tickets WHERE destination_hash=?1",
+                [destination_hash.as_slice()],
+            )
+            .map_err(database_error)
+    }
+    fn cull_tickets(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        self.connection
+            .execute(
+                "DELETE FROM tickets WHERE used != 0 OR expires < ?1",
+                [cutoff],
+            )
+            .map_err(database_error)
+    }
+    fn upsert_stamp_cost(&mut self, entry: StoredStampCost) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO stamp_costs(destination_hash, cost, recorded_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(destination_hash) DO UPDATE SET cost=excluded.cost, recorded_at=excluded.recorded_at",
+            params![entry.destination_hash.as_slice(), i64::from(entry.cost), entry.recorded_at],
+        ).map(|_| ()).map_err(database_error)
+    }
+    fn stamp_cost(
+        &self,
+        destination_hash: &[u8; 16],
+    ) -> Result<Option<StoredStampCost>, StorageError> {
+        self.connection.query_row("SELECT destination_hash, cost, recorded_at FROM stamp_costs WHERE destination_hash=?1", [destination_hash.as_slice()], |row| {
+            let cost = u8::try_from(row.get::<_, i64>(1)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Integer, Box::new(error)))?;
+            Ok(StoredStampCost { destination_hash: fixed_blob(row.get(0)?, 0)?, cost, recorded_at: row.get(2)? })
+        }).optional().map_err(database_error)
+    }
+    fn remove_stamp_cost(&mut self, destination_hash: &[u8; 16]) -> Result<bool, StorageError> {
+        self.connection
+            .execute(
+                "DELETE FROM stamp_costs WHERE destination_hash=?1",
+                [destination_hash.as_slice()],
+            )
+            .map(|count| count == 1)
+            .map_err(database_error)
+    }
+    fn cull_stamp_costs_before(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        self.connection
+            .execute("DELETE FROM stamp_costs WHERE recorded_at < ?1", [cutoff])
+            .map_err(database_error)
+    }
+    fn stamp_cost_count(&self) -> Result<usize, StorageError> {
+        let count = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM stamp_costs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(database_error)?;
+        i64_to_usize(count, "stamp cost count")
+    }
+    fn upsert_identity(&mut self, i: StoredIdentity) -> Result<(), StorageError> {
+        self.connection.execute("INSERT INTO identities(destination_hash,public_key,updated_at) VALUES(?1,?2,?3) ON CONFLICT(destination_hash) DO UPDATE SET public_key=excluded.public_key,updated_at=excluded.updated_at",params![i.destination_hash.as_slice(),i.public_key.as_slice(),i.updated_at]).map(|_|()).map_err(database_error)
+    }
+    fn identity(&self, h: &[u8; 16]) -> Result<Option<StoredIdentity>, StorageError> {
+        self.connection.query_row("SELECT destination_hash,public_key,updated_at FROM identities WHERE destination_hash=?1",[h.as_slice()],|r|Ok(StoredIdentity{destination_hash:fixed_blob(r.get(0)?,0)?,public_key:fixed_blob(r.get(1)?,1)?,updated_at:r.get(2)?})).optional().map_err(database_error)
+    }
+    fn identity_page(&self, limit: usize) -> Result<Vec<StoredIdentity>, StorageError> {
+        let mut s=self.connection.prepare("SELECT destination_hash,public_key,updated_at FROM identities ORDER BY updated_at DESC LIMIT ?1").map_err(database_error)?;
+        s.query_map([usize_to_i64(limit)?], |r| {
+            Ok(StoredIdentity {
+                destination_hash: fixed_blob(r.get(0)?, 0)?,
+                public_key: fixed_blob(r.get(1)?, 1)?,
+                updated_at: r.get(2)?,
+            })
+        })
+        .map_err(database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error)
+    }
+    fn upsert_ratchet(&mut self, x: StoredRatchet) -> Result<(), StorageError> {
+        self.connection.execute("INSERT INTO received_ratchets(destination_hash,ratchet_key,received_at) VALUES(?1,?2,?3) ON CONFLICT(destination_hash) DO UPDATE SET ratchet_key=excluded.ratchet_key,received_at=excluded.received_at",params![x.destination_hash.as_slice(),x.ratchet_key.as_slice(),x.received_at]).map(|_|()).map_err(database_error)
+    }
+    fn ratchet(&self, h: &[u8; 16]) -> Result<Option<StoredRatchet>, StorageError> {
+        self.connection.query_row("SELECT destination_hash,ratchet_key,received_at FROM received_ratchets WHERE destination_hash=?1",[h.as_slice()],|r|Ok(StoredRatchet{destination_hash:fixed_blob(r.get(0)?,0)?,ratchet_key:fixed_blob(r.get(1)?,1)?,received_at:r.get(2)?})).optional().map_err(database_error)
+    }
+    fn ratchet_page(&self, cutoff: f64, limit: usize) -> Result<Vec<StoredRatchet>, StorageError> {
+        let mut s=self.connection.prepare("SELECT destination_hash,ratchet_key,received_at FROM received_ratchets WHERE received_at>=?1 ORDER BY received_at DESC LIMIT ?2").map_err(database_error)?;
+        s.query_map(params![cutoff, usize_to_i64(limit)?], |r| {
+            Ok(StoredRatchet {
+                destination_hash: fixed_blob(r.get(0)?, 0)?,
+                ratchet_key: fixed_blob(r.get(1)?, 1)?,
+                received_at: r.get(2)?,
+            })
+        })
+        .map_err(database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error)
+    }
+    fn cull_ratchets_before(&mut self, cutoff: f64) -> Result<usize, StorageError> {
+        self.connection
+            .execute(
+                "DELETE FROM received_ratchets WHERE received_at < ?1",
+                [cutoff],
+            )
+            .map_err(database_error)
+    }
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
@@ -605,6 +725,31 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
             )
             .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+    }
+    if found < 4 {
+        let transaction = connection.transaction().map_err(database_error)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE tickets (
+                 token BLOB PRIMARY KEY CHECK(length(token)=16),
+                 destination_hash BLOB NOT NULL CHECK(length(destination_hash)=16),
+                 expires REAL NOT NULL, used INTEGER NOT NULL
+             ) WITHOUT ROWID;
+             CREATE INDEX tickets_destination_expiry ON tickets(destination_hash, expires);
+             CREATE TABLE stamp_costs (
+                 destination_hash BLOB PRIMARY KEY CHECK(length(destination_hash)=16),
+                 cost INTEGER NOT NULL, recorded_at REAL NOT NULL
+             ) WITHOUT ROWID;
+             INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+    }
+    if found < 5 {
+        let transaction = connection.transaction().map_err(database_error)?;
+        transaction.execute_batch("CREATE TABLE identities(destination_hash BLOB PRIMARY KEY CHECK(length(destination_hash)=16),public_key BLOB NOT NULL CHECK(length(public_key)=64),updated_at REAL NOT NULL) WITHOUT ROWID; CREATE INDEX identities_updated ON identities(updated_at); CREATE TABLE received_ratchets(destination_hash BLOB PRIMARY KEY CHECK(length(destination_hash)=16),ratchet_key BLOB NOT NULL CHECK(length(ratchet_key)=32),received_at REAL NOT NULL) WITHOUT ROWID; CREATE INDEX ratchets_received ON received_ratchets(received_at); INSERT INTO schema_meta(key,value) VALUES('schema_version','5') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(database_error)?;
         transaction.commit().map_err(database_error)?;
     }
     Ok(())
@@ -775,7 +920,7 @@ mod tests {
         drop(connection);
 
         let mut storage = SqliteStorage::open(&path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 3);
+        assert_eq!(storage.schema_version().unwrap(), 5);
         assert_eq!(storage.message_store_stats().unwrap().count, 0);
         assert!(
             storage
