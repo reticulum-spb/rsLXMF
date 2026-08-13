@@ -216,23 +216,24 @@
 
 ## 8. Outbound и deferred messages
 
-- [ ] Создать таблицу `outbound_messages`.
-- [ ] Определить стабильное кодирование полного `LxMessage`.
-- [ ] Хранить delivery state отдельно от encoded message.
-- [ ] Индексировать `state` и `next_delivery_attempt`.
-- [ ] Перенести `pending_outbound` в SQLite.
-- [ ] Выбирать только готовые к попытке сообщения.
-- [ ] Загружать полное сообщение непосредственно перед обработкой.
-- [ ] После попытки атомарно обновлять attempts, progress и next attempt.
-- [ ] Удалять успешно доставленные и окончательно failed сообщения.
-- [ ] Перенести `pending_deferred_stamps`.
-- [ ] В памяти оставлять только одну активную stamp job.
-- [ ] Корректно восстанавливать незавершённую stamp job после restart.
-- [ ] Сохранить порядок и семантику callbacks.
-- [ ] Добавить тесты повторных попыток после restart.
-- [ ] Добавить тесты expiry `MESSAGE_EXPIRY`.
-- [ ] Добавить тесты `MAX_DELIVERY_ATTEMPTS`.
-- [ ] Измерить RSS при искусственно большой outbound queue.
+- [x] Создать таблицу `outbound_messages`.
+- [x] Определить стабильное версионированное кодирование полного `LxMessage`.
+- [x] Хранить delivery state отдельно от encoded message.
+- [x] Индексировать `state` и `next_delivery_attempt`.
+- [x] Перенести `pending_outbound` в SQLite.
+- [x] Выбирать только готовые к попытке сообщения.
+- [x] Загружать полное сообщение непосредственно перед обработкой.
+- [x] После попытки атомарно обновлять attempts, progress и next attempt.
+- [x] Удалять успешно доставленные и окончательно failed сообщения.
+- [x] Перенести `pending_deferred_stamps`.
+- [x] В памяти оставлять только одну активную stamp job.
+- [x] Корректно восстанавливать незавершённую stamp job после restart.
+- [x] Сохранить порядок и семантику callbacks через runtime callback cache.
+- [x] Добавить тесты повторных попыток после restart.
+- [x] Добавить тесты expiry `MESSAGE_EXPIRY`.
+- [x] Добавить тесты `MAX_DELIVERY_ATTEMPTS`.
+- [x] Добавить bounded-memory тест искусственно большой outbound queue; реальное
+  измерение RSS на OrangePi остаётся в разделе 0.
 
 ## 9. Остальное долговременное состояние
 

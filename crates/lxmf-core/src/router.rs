@@ -10,12 +10,13 @@ use std::fmt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::*;
-use crate::message::{LxMessage, MessageError};
+use crate::message::{LxMessage, MessageCallbacks, MessageError};
 use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::stamper;
 use crate::storage::{
-    LxmfStorage, MemoryStorage, StorageError, StoredMessageMetadata, TransientIdKind,
+    LxmfStorage, MemoryStorage, StorageError, StoredMessageMetadata, StoredOutboundMessage,
+    StoredOutboundMetadata, TransientIdKind,
 };
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
@@ -260,6 +261,8 @@ pub fn plan_direct_delivery(
 /// LXMF router — owns all mutable state under the actor pattern.
 pub struct LxmRouter {
     storage: Box<dyn LxmfStorage>,
+    storage_authoritative: bool,
+    outbound_callbacks: HashMap<[u8; 32], MessageCallbacks>,
     pub config: RouterConfig,
     pub pending_outbound: Vec<LxMessage>,
     /// Messages awaiting deferred stamp generation, keyed by message hash.
@@ -309,6 +312,47 @@ enum DirectOutboundHandling {
     LeavePending,
 }
 
+fn decode_message_state(value: u8) -> Result<MessageState, MessageError> {
+    match value {
+        0x00 => Ok(MessageState::Generating),
+        0x01 => Ok(MessageState::Outbound),
+        0x02 => Ok(MessageState::Sending),
+        0x04 => Ok(MessageState::Sent),
+        0x08 => Ok(MessageState::Delivered),
+        0xFD => Ok(MessageState::Rejected),
+        0xFE => Ok(MessageState::Cancelled),
+        0xFF => Ok(MessageState::Failed),
+        _ => Err(MessageError::UnpackFailed(format!(
+            "invalid message state {value}"
+        ))),
+    }
+}
+
+fn decode_delivery_method(value: u8) -> Result<DeliveryMethod, MessageError> {
+    match value {
+        0x01 => Ok(DeliveryMethod::Opportunistic),
+        0x02 => Ok(DeliveryMethod::Direct),
+        0x03 => Ok(DeliveryMethod::Propagated),
+        0x05 => Ok(DeliveryMethod::Paper),
+        _ => Err(MessageError::UnpackFailed(format!(
+            "invalid delivery method {value}"
+        ))),
+    }
+}
+
+fn outbound_summary_from_metadata(metadata: StoredOutboundMetadata) -> Option<OutboundSummary> {
+    Some(OutboundSummary {
+        message_id: Some(metadata.message_id),
+        destination_hash: metadata.destination_hash,
+        state: decode_message_state(metadata.state).ok()?,
+        method: decode_delivery_method(metadata.delivery_method).ok()?,
+        delivery_attempts: metadata.delivery_attempts,
+        last_delivery_attempt: metadata.last_delivery_attempt,
+        next_delivery_attempt: metadata.next_delivery_attempt,
+        progress: metadata.progress,
+    })
+}
+
 /// Callback invoked when a message is delivered locally.
 pub type DeliveryCallback = Box<dyn Fn(&LxMessage) + Send>;
 
@@ -340,6 +384,8 @@ impl LxmRouter {
     pub fn with_storage_backend(config: RouterConfig, storage: Box<dyn LxmfStorage>) -> Self {
         Self {
             storage,
+            storage_authoritative: false,
+            outbound_callbacks: HashMap::new(),
             config,
             pending_outbound: Vec::new(),
             pending_deferred_stamps: HashMap::new(),
@@ -367,6 +413,117 @@ impl LxmRouter {
             client_propagation_messages_served: 0,
             unpeered_propagation_incoming: 0,
             unpeered_propagation_rx_bytes: 0,
+        }
+    }
+
+    pub fn with_shared_storage_backend(
+        config: RouterConfig,
+        storage: crate::storage::StorageHandle,
+    ) -> Self {
+        let mut router = Self::with_storage_backend(config, Box::new(storage));
+        router.storage_authoritative = true;
+        router
+    }
+
+    fn persist_outbound_message(&mut self, message: &LxMessage, deferred: bool) -> bool {
+        let Some(message_id) = message.message_id.or(message.hash) else {
+            tracing::error!("cannot persist outbound message without message ID");
+            return false;
+        };
+        let encoded_message = match message.encode_outbound_storage() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                tracing::error!(%error, "failed to encode outbound message");
+                return false;
+            }
+        };
+        let stored = StoredOutboundMessage {
+            metadata: StoredOutboundMetadata {
+                message_id,
+                destination_hash: message.destination_hash,
+                state: message.state as u8,
+                delivery_method: message.method as u8,
+                deferred,
+                next_delivery_attempt: message.next_delivery_attempt,
+                last_delivery_attempt: message.last_delivery_attempt,
+                delivery_attempts: message.delivery_attempts,
+                created_at: message.timestamp,
+                progress: message.progress,
+            },
+            encoded_message,
+        };
+        if let Err(error) = self.storage.upsert_outbound_message(&stored) {
+            tracing::error!(%error, "failed to persist outbound message");
+            return false;
+        }
+        self.outbound_callbacks
+            .insert(message_id, message.callbacks.clone());
+        true
+    }
+
+    fn restore_outbound_message(
+        &self,
+        stored: StoredOutboundMessage,
+    ) -> Result<LxMessage, MessageError> {
+        let metadata = stored.metadata;
+        let mut message = LxMessage::decode_outbound_storage(&stored.encoded_message)?;
+        message.hash = Some(metadata.message_id);
+        message.message_id = Some(metadata.message_id);
+        message.transient_id = Some(metadata.message_id);
+        message.state = decode_message_state(metadata.state)?;
+        message.method = decode_delivery_method(metadata.delivery_method)?;
+        message.next_delivery_attempt = metadata.next_delivery_attempt;
+        message.last_delivery_attempt = metadata.last_delivery_attempt;
+        message.delivery_attempts = metadata.delivery_attempts;
+        message.timestamp = metadata.created_at;
+        message.progress = metadata.progress;
+        if let Some(callbacks) = self.outbound_callbacks.get(&metadata.message_id) {
+            message.callbacks = callbacks.clone();
+        }
+        Ok(message)
+    }
+
+    fn hydrate_ready_outbound(&mut self) {
+        if !self.storage_authoritative || !self.pending_outbound.is_empty() {
+            return;
+        }
+        let Ok(ready) = self.storage.outbound_ready(now_f64(), false, 1) else {
+            return;
+        };
+        let Some(metadata) = ready.first() else {
+            return;
+        };
+        match self.storage.outbound_message(&metadata.message_id) {
+            Ok(Some(stored)) => match self.restore_outbound_message(stored) {
+                Ok(message) => self.pending_outbound.push(message),
+                Err(error) => tracing::error!(%error, "failed to restore outbound message"),
+            },
+            Ok(None) => {}
+            Err(error) => tracing::error!(%error, "failed to load outbound message"),
+        }
+    }
+
+    fn hydrate_deferred_stamp(&mut self) {
+        if !self.storage_authoritative
+            || !self.pending_deferred_stamps.is_empty()
+            || self.active_deferred_stamp.is_some()
+        {
+            return;
+        }
+        let Ok(ready) = self.storage.outbound_ready(now_f64(), true, 1) else {
+            return;
+        };
+        let Some(metadata) = ready.first() else {
+            return;
+        };
+        if let Ok(Some(stored)) = self.storage.outbound_message(&metadata.message_id) {
+            match self.restore_outbound_message(stored) {
+                Ok(message) => {
+                    self.pending_deferred_stamps
+                        .insert(metadata.message_id, message);
+                }
+                Err(error) => tracing::error!(%error, "failed to restore deferred stamp message"),
+            }
         }
     }
 
@@ -468,6 +625,15 @@ impl LxmRouter {
 
     /// Return a bounded, payload-free snapshot of queued outbound messages.
     pub fn outbound_summaries(&self, limit: usize) -> Vec<OutboundSummary> {
+        if self.storage_authoritative {
+            return self
+                .storage
+                .outbound_metadata_page(false, limit)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(outbound_summary_from_metadata)
+                .collect();
+        }
         self.pending_outbound
             .iter()
             .take(limit)
@@ -486,6 +652,15 @@ impl LxmRouter {
 
     /// Query one deferred-stamp message without exposing the backing map.
     pub fn deferred_stamp_summary(&self, message_id: &[u8; 32]) -> Option<OutboundSummary> {
+        if self.storage_authoritative {
+            return self
+                .storage
+                .outbound_message(message_id)
+                .ok()
+                .flatten()
+                .filter(|message| message.metadata.deferred)
+                .and_then(|message| outbound_summary_from_metadata(message.metadata));
+        }
         self.pending_deferred_stamps
             .get(message_id)
             .map(|message| OutboundSummary {
@@ -611,7 +786,13 @@ impl LxmRouter {
             if self.config.ext.defer_stamp_generation {
                 if let Some(message_hash) = message.message_id.or(message.hash) {
                     message.state = MessageState::Outbound;
-                    self.pending_deferred_stamps.insert(message_hash, message);
+                    if self.storage_authoritative {
+                        if !self.persist_outbound_message(&message, true) {
+                            message.mark_failed();
+                        }
+                    } else {
+                        self.pending_deferred_stamps.insert(message_hash, message);
+                    }
                     return Ok(());
                 }
             } else {
@@ -633,7 +814,13 @@ impl LxmRouter {
         }
 
         message.state = MessageState::Outbound;
-        self.pending_outbound.push(message);
+        if self.storage_authoritative {
+            if !self.persist_outbound_message(&message, false) {
+                message.mark_failed();
+            }
+        } else {
+            self.pending_outbound.push(message);
+        }
         Ok(())
     }
 
@@ -649,7 +836,13 @@ impl LxmRouter {
             return Some(message);
         };
         message.state = MessageState::Outbound;
-        self.pending_deferred_stamps.insert(message_hash, message);
+        if self.storage_authoritative {
+            if !self.persist_outbound_message(&message, true) {
+                return Some(message);
+            }
+        } else {
+            self.pending_deferred_stamps.insert(message_hash, message);
+        }
         None
     }
 
@@ -657,6 +850,8 @@ impl LxmRouter {
     ///
     /// Python reference: `LXMRouter.process_deferred_stamps` — LXMRouter.py:2407-2498.
     pub fn process_deferred_stamps(&mut self) {
+        self.hydrate_ready_outbound();
+        self.hydrate_deferred_stamp();
         self.poll_active_deferred_stamp();
         if self.active_deferred_stamp.is_some() {
             return;
@@ -669,7 +864,11 @@ impl LxmRouter {
         if cost == 0 {
             if let Some(mut message) = self.pending_deferred_stamps.remove(&message_hash) {
                 message.get_stamp();
-                self.pending_outbound.push(message);
+                if self.storage_authoritative {
+                    self.persist_outbound_message(&message, false);
+                } else {
+                    self.pending_outbound.push(message);
+                }
             }
             return;
         }
@@ -698,10 +897,18 @@ impl LxmRouter {
                 Some((stamp, value)) => {
                     message.stamp = Some(stamp.to_vec());
                     message.stamp_value = Some(value as u16);
-                    self.pending_outbound.push(message);
+                    if self.storage_authoritative {
+                        self.persist_outbound_message(&message, false);
+                    } else {
+                        self.pending_outbound.push(message);
+                    }
                 }
                 None => {
                     message.mark_failed();
+                    if self.storage_authoritative {
+                        let _ = self.storage.remove_outbound_message(&message_hash);
+                        self.outbound_callbacks.remove(&message_hash);
+                    }
                 }
             }
         }
@@ -717,12 +924,20 @@ impl LxmRouter {
                 if let Some(mut message) = self.pending_deferred_stamps.remove(&job.message_hash) {
                     message.stamp = Some(stamp.to_vec());
                     message.stamp_value = Some(value as u16);
-                    self.pending_outbound.push(message);
+                    if self.storage_authoritative {
+                        self.persist_outbound_message(&message, false);
+                    } else {
+                        self.pending_outbound.push(message);
+                    }
                 }
             }
             Ok(stamper::DeferredStampResult::Cancelled) => {
                 if let Some(mut message) = self.pending_deferred_stamps.remove(&job.message_hash) {
                     message.cancel();
+                    if self.storage_authoritative {
+                        let _ = self.storage.remove_outbound_message(&job.message_hash);
+                        self.outbound_callbacks.remove(&job.message_hash);
+                    }
                 }
             }
             Err(oneshot::error::TryRecvError::Empty) => {
@@ -731,6 +946,10 @@ impl LxmRouter {
             Err(oneshot::error::TryRecvError::Closed) => {
                 if let Some(mut message) = self.pending_deferred_stamps.remove(&job.message_hash) {
                     message.mark_failed();
+                    if self.storage_authoritative {
+                        let _ = self.storage.remove_outbound_message(&job.message_hash);
+                        self.outbound_callbacks.remove(&job.message_hash);
+                    }
                 }
             }
         }
@@ -921,6 +1140,10 @@ impl LxmRouter {
             let msg = &mut self.pending_outbound[pos];
             msg.cancel();
             self.pending_outbound.remove(pos);
+            if self.storage_authoritative {
+                let _ = self.storage.remove_outbound_message(message_hash);
+                self.outbound_callbacks.remove(message_hash);
+            }
             return true;
         }
 
@@ -934,7 +1157,24 @@ impl LxmRouter {
             {
                 job.handle.cancel();
             }
+            if self.storage_authoritative {
+                let _ = self.storage.remove_outbound_message(message_hash);
+                self.outbound_callbacks.remove(message_hash);
+            }
             return true;
+        }
+
+        if self.storage_authoritative
+            && let Ok(Some(stored)) = self.storage.outbound_message(message_hash)
+            && let Ok(mut message) = self.restore_outbound_message(stored)
+        {
+            message.cancel();
+            let removed = self
+                .storage
+                .remove_outbound_message(message_hash)
+                .unwrap_or(false);
+            self.outbound_callbacks.remove(message_hash);
+            return removed;
         }
 
         false
@@ -948,11 +1188,27 @@ impl LxmRouter {
             .iter()
             .position(|m| m.hash.as_ref() == Some(message_hash))
         else {
+            if self.storage_authoritative
+                && let Ok(Some(stored)) = self.storage.outbound_message(message_hash)
+                && let Ok(mut message) = self.restore_outbound_message(stored)
+            {
+                message.mark_delivered();
+                let removed = self
+                    .storage
+                    .remove_outbound_message(message_hash)
+                    .unwrap_or(false);
+                self.outbound_callbacks.remove(message_hash);
+                return removed;
+            }
             return false;
         };
 
         let mut msg = self.pending_outbound.remove(pos);
         msg.mark_delivered();
+        if self.storage_authoritative {
+            let _ = self.storage.remove_outbound_message(message_hash);
+            self.outbound_callbacks.remove(message_hash);
+        }
         true
     }
 
@@ -964,11 +1220,27 @@ impl LxmRouter {
             .iter()
             .position(|m| m.hash.as_ref() == Some(message_hash))
         else {
+            if self.storage_authoritative
+                && let Ok(Some(stored)) = self.storage.outbound_message(message_hash)
+                && let Ok(mut message) = self.restore_outbound_message(stored)
+            {
+                message.mark_failed();
+                let removed = self
+                    .storage
+                    .remove_outbound_message(message_hash)
+                    .unwrap_or(false);
+                self.outbound_callbacks.remove(message_hash);
+                return removed;
+            }
             return false;
         };
 
         let mut msg = self.pending_outbound.remove(pos);
         msg.mark_failed();
+        if self.storage_authoritative {
+            let _ = self.storage.remove_outbound_message(message_hash);
+            self.outbound_callbacks.remove(message_hash);
+        }
         true
     }
 
@@ -980,11 +1252,27 @@ impl LxmRouter {
             .iter()
             .position(|m| m.hash.as_ref() == Some(message_hash))
         else {
+            if self.storage_authoritative
+                && let Ok(Some(stored)) = self.storage.outbound_message(message_hash)
+                && let Ok(mut message) = self.restore_outbound_message(stored)
+            {
+                message.mark_rejected();
+                let removed = self
+                    .storage
+                    .remove_outbound_message(message_hash)
+                    .unwrap_or(false);
+                self.outbound_callbacks.remove(message_hash);
+                return removed;
+            }
             return false;
         };
 
         let mut msg = self.pending_outbound.remove(pos);
         msg.mark_rejected();
+        if self.storage_authoritative {
+            let _ = self.storage.remove_outbound_message(message_hash);
+            self.outbound_callbacks.remove(message_hash);
+        }
         true
     }
 
@@ -996,12 +1284,26 @@ impl LxmRouter {
             .iter_mut()
             .find(|m| m.hash.as_ref() == Some(message_hash))
         else {
+            if self.storage_authoritative
+                && let Ok(Some(mut stored)) = self.storage.outbound_message(message_hash)
+            {
+                stored.metadata.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
+                stored.metadata.progress = stored.metadata.progress.max(0.01);
+                return self
+                    .storage
+                    .update_outbound_delivery(&stored.metadata)
+                    .unwrap_or(false);
+            }
             return false;
         };
 
         msg.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
         if msg.progress < 0.01 {
             msg.progress = 0.01;
+        }
+        if self.storage_authoritative {
+            let stored = msg.clone();
+            self.persist_outbound_message(&stored, false);
         }
         true
     }
@@ -1010,11 +1312,18 @@ impl LxmRouter {
     ///
     /// Python reference: `LXMRouter.get_outbound_progress` — LXMRouter.py:489-495.
     pub fn get_outbound_progress(&self, message_hash: &[u8; 32]) -> Option<f64> {
-        self.pending_outbound
+        let cached = self
+            .pending_outbound
             .iter()
             .chain(self.pending_deferred_stamps.values())
             .find(|m| m.hash.as_ref() == Some(message_hash))
-            .map(|m| m.progress)
+            .map(|m| m.progress);
+        cached.or_else(|| {
+            self.storage_authoritative
+                .then(|| self.storage.outbound_message(message_hash).ok().flatten())
+                .flatten()
+                .map(|stored| stored.metadata.progress)
+        })
     }
 
     /// Get the cached required stamp cost for a destination (delivery).
@@ -1565,6 +1874,7 @@ impl LxmRouter {
         if !self.config.ext.processing_outbound {
             return Vec::new();
         }
+        self.hydrate_ready_outbound();
 
         let mut actions = Vec::new();
         let mut processed = 0usize;
@@ -1668,6 +1978,7 @@ impl LxmRouter {
             }
         }
 
+        self.sync_authoritative_outbound(&actions);
         actions
     }
 
@@ -1684,6 +1995,7 @@ impl LxmRouter {
         if !self.config.ext.processing_outbound {
             return Vec::new();
         }
+        self.hydrate_ready_outbound();
 
         let mut actions = Vec::new();
         let mut processed = 0usize;
@@ -1818,7 +2130,36 @@ impl LxmRouter {
             }
         }
 
+        self.sync_authoritative_outbound(&actions);
         actions
+    }
+
+    fn sync_authoritative_outbound(&mut self, actions: &[OutboundAction]) {
+        if !self.storage_authoritative {
+            return;
+        }
+        let pending = self.pending_outbound.clone();
+        for message in &pending {
+            self.persist_outbound_message(message, false);
+        }
+        for action in actions {
+            let (message, terminal_or_handed_off) = match action {
+                OutboundAction::Failed(message) | OutboundAction::Expired(message) => {
+                    (message, true)
+                }
+                OutboundAction::DeliverDirect { message, .. }
+                | OutboundAction::DeliverPropagated { message, .. }
+                | OutboundAction::DeliverOpportunistic { message, .. } => (message, true),
+                OutboundAction::PlanDirect { message, .. } => (message, false),
+            };
+            if !terminal_or_handed_off {
+                continue;
+            }
+            if let Some(message_id) = message.message_id.or(message.hash) {
+                let _ = self.storage.remove_outbound_message(&message_id);
+                self.outbound_callbacks.remove(&message_id);
+            }
+        }
     }
 
     pub fn cull_stamp_costs(&mut self) {
@@ -1983,9 +2324,19 @@ impl LxmRouter {
 
     /// Get summary statistics.
     pub fn stats(&self) -> RouterStats {
+        let pending_outbound = if self.storage_authoritative {
+            self.storage.outbound_count(Some(false)).unwrap_or_default()
+        } else {
+            self.pending_outbound.len()
+        };
+        let pending_deferred_stamps = if self.storage_authoritative {
+            self.storage.outbound_count(Some(true)).unwrap_or_default()
+        } else {
+            self.pending_deferred_stamps.len()
+        };
         RouterStats {
-            pending_outbound: self.pending_outbound.len(),
-            pending_deferred_stamps: self.pending_deferred_stamps.len(),
+            pending_outbound,
+            pending_deferred_stamps,
             peers: self.peers.len(),
             propagation_entries: self.propagation_store.len(),
             propagation_size: self.propagation_store.total_size(),
@@ -2102,6 +2453,146 @@ pub struct NodeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn durable_outbound_message(method: DeliveryMethod) -> LxMessage {
+        let mut message = LxMessage::new([0xA1; 16], [0xB1; 16], "durable", "outbound", method);
+        message
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::generate())
+            .unwrap();
+        message
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_outbound_queue_recovers_and_loads_only_when_ready() {
+        use crate::storage::spawn_sqlite_storage_actor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outbound-restart.sqlite");
+        let mut message = durable_outbound_message(DeliveryMethod::Direct);
+        message.delivery_attempts = 2;
+        message.progress = 0.4;
+        message.next_delivery_attempt = now_f64() + 3_600.0;
+        let message_id = message.message_id.unwrap();
+        {
+            let storage = spawn_sqlite_storage_actor(path.clone()).unwrap();
+            let mut router =
+                LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage);
+            router.send(message);
+            assert!(router.pending_outbound.is_empty());
+            assert_eq!(router.stats().pending_outbound, 1);
+        }
+
+        let mut storage = spawn_sqlite_storage_actor(path).unwrap();
+        let mut router =
+            LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage.clone());
+        assert!(router.pending_outbound.is_empty());
+        assert_eq!(router.outbound_summaries(1)[0].message_id, Some(message_id));
+        assert!(router.process_outbound().is_empty());
+        let mut stored = storage.outbound_message(&message_id).unwrap().unwrap();
+        stored.metadata.next_delivery_attempt = 0.0;
+        storage.update_outbound_delivery(&stored.metadata).unwrap();
+        let actions = router.process_outbound();
+        let OutboundAction::DeliverDirect { message, .. } = &actions[0] else {
+            panic!("recovered direct message must be delivered");
+        };
+        assert_eq!(message.delivery_attempts, 2);
+        assert_eq!(message.progress, 0.4);
+        assert_eq!(router.stats().pending_outbound, 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_outbound_expiry_attempts_and_callbacks_are_terminal() {
+        use crate::storage::spawn_sqlite_storage_actor;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = spawn_sqlite_storage_actor(directory.path().join("terminal.sqlite")).unwrap();
+        let mut router = LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage);
+
+        let mut expired = durable_outbound_message(DeliveryMethod::Direct);
+        expired.timestamp = now_f64() - MESSAGE_EXPIRY as f64 - 1.0;
+        router.send(expired);
+        assert!(matches!(
+            router.process_outbound().as_slice(),
+            [OutboundAction::Expired(_)]
+        ));
+
+        let mut exhausted = durable_outbound_message(DeliveryMethod::Direct);
+        exhausted.delivery_attempts = MAX_DELIVERY_ATTEMPTS + 1;
+        router.send(exhausted);
+        let exhausted_actions = router.process_outbound();
+        assert!(
+            matches!(exhausted_actions.as_slice(), [OutboundAction::Failed(_)]),
+            "unexpected actions: {exhausted_actions:?}"
+        );
+
+        let failures = Arc::new(AtomicUsize::new(0));
+        let mut callback_message = durable_outbound_message(DeliveryMethod::Direct);
+        let callback_id = callback_message.message_id.unwrap();
+        let callback_failures = failures.clone();
+        callback_message.callbacks.on_failed = Some(Arc::new(move |_| {
+            callback_failures.fetch_add(1, Ordering::SeqCst);
+        }));
+        router.send(callback_message);
+        assert!(router.mark_outbound_failed(&callback_id));
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(router.stats().pending_outbound, 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_deferred_stamp_recovers_after_restart() {
+        use crate::storage::spawn_sqlite_storage_actor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deferred-restart.sqlite");
+        let mut message = durable_outbound_message(DeliveryMethod::Direct);
+        message.stamp_cost = Some(0);
+        {
+            let storage = spawn_sqlite_storage_actor(path.clone()).unwrap();
+            let mut router =
+                LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage);
+            assert!(router.defer_stamp(message).is_none());
+            assert_eq!(router.stats().pending_deferred_stamps, 1);
+        }
+
+        let storage = spawn_sqlite_storage_actor(path).unwrap();
+        let mut router = LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage);
+        router.process_deferred_stamps();
+        assert_eq!(router.stats().pending_deferred_stamps, 0);
+        assert_eq!(router.stats().pending_outbound, 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_large_outbound_queue_stays_out_of_ram() {
+        use crate::storage::spawn_sqlite_storage_actor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            spawn_sqlite_storage_actor(directory.path().join("large-outbound.sqlite")).unwrap();
+        let mut router = LxmRouter::with_shared_storage_backend(RouterConfig::default(), storage);
+        for index in 0..64_u8 {
+            let mut message = durable_outbound_message(DeliveryMethod::Direct);
+            message.content = format!("outbound-{index}");
+            message
+                .sign(&rns_crypto::ed25519::Ed25519PrivateKey::generate())
+                .unwrap();
+            message.next_delivery_attempt = now_f64() + 3_600.0;
+            router.send(message);
+        }
+
+        assert_eq!(router.stats().pending_outbound, 64);
+        assert!(router.pending_outbound.is_empty());
+        assert!(router.outbound_summaries(8).len() <= 8);
+        assert!(router.process_outbound().is_empty());
+        assert!(router.pending_outbound.is_empty());
+    }
 
     fn direct_policy_message() -> LxMessage {
         let mut message = LxMessage::new(

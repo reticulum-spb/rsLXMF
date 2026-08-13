@@ -96,6 +96,26 @@ pub struct MessageStoreStats {
     pub payload_size: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredOutboundMetadata {
+    pub message_id: [u8; 32],
+    pub destination_hash: [u8; 16],
+    pub state: u8,
+    pub delivery_method: u8,
+    pub deferred: bool,
+    pub next_delivery_attempt: f64,
+    pub last_delivery_attempt: f64,
+    pub delivery_attempts: u32,
+    pub created_at: f64,
+    pub progress: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredOutboundMessage {
+    pub metadata: StoredOutboundMetadata,
+    pub encoded_message: Vec<u8>,
+}
+
 /// Synchronous because the router/storage actor owns each implementation.
 pub trait LxmfStorage: Send {
     fn contains_transient_id(
@@ -173,12 +193,45 @@ pub trait LxmfStorage: Send {
         prioritised_destinations: &[[u8; 16]],
         limit: usize,
     ) -> Result<usize, StorageError>;
+
+    fn upsert_outbound_message(
+        &mut self,
+        message: &StoredOutboundMessage,
+    ) -> Result<(), StorageError>;
+
+    fn outbound_message(
+        &self,
+        message_id: &[u8; 32],
+    ) -> Result<Option<StoredOutboundMessage>, StorageError>;
+
+    fn outbound_ready(
+        &self,
+        now: f64,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError>;
+
+    fn outbound_metadata_page(
+        &self,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError>;
+
+    fn update_outbound_delivery(
+        &mut self,
+        metadata: &StoredOutboundMetadata,
+    ) -> Result<bool, StorageError>;
+
+    fn remove_outbound_message(&mut self, message_id: &[u8; 32]) -> Result<bool, StorageError>;
+
+    fn outbound_count(&self, deferred: Option<bool>) -> Result<usize, StorageError>;
 }
 
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
     transient_ids: HashMap<(TransientIdKind, PropagationTransientId), i64>,
     messages: HashMap<PropagationTransientId, StoredMessage>,
+    outbound_messages: HashMap<[u8; 32], StoredOutboundMessage>,
 }
 
 impl MemoryStorage {
@@ -387,6 +440,96 @@ impl LxmfStorage for MemoryStorage {
         }
         Ok(selected.len())
     }
+
+    fn upsert_outbound_message(
+        &mut self,
+        message: &StoredOutboundMessage,
+    ) -> Result<(), StorageError> {
+        self.outbound_messages
+            .insert(message.metadata.message_id, message.clone());
+        Ok(())
+    }
+
+    fn outbound_message(
+        &self,
+        message_id: &[u8; 32],
+    ) -> Result<Option<StoredOutboundMessage>, StorageError> {
+        Ok(self.outbound_messages.get(message_id).cloned())
+    }
+
+    fn outbound_ready(
+        &self,
+        now: f64,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError> {
+        let mut ready = self
+            .outbound_messages
+            .values()
+            .filter(|message| {
+                message.metadata.deferred == deferred
+                    && message.metadata.next_delivery_attempt <= now
+            })
+            .map(|message| message.metadata.clone())
+            .collect::<Vec<_>>();
+        ready.sort_by(|left, right| {
+            left.metadata_order_key()
+                .partial_cmp(&right.metadata_order_key())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.message_id.cmp(&right.message_id))
+        });
+        ready.truncate(limit);
+        Ok(ready)
+    }
+
+    fn outbound_metadata_page(
+        &self,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError> {
+        let mut entries = self
+            .outbound_messages
+            .values()
+            .filter(|message| message.metadata.deferred == deferred)
+            .map(|message| message.metadata.clone())
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.created_at
+                .total_cmp(&right.created_at)
+                .then_with(|| left.message_id.cmp(&right.message_id))
+        });
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    fn update_outbound_delivery(
+        &mut self,
+        metadata: &StoredOutboundMetadata,
+    ) -> Result<bool, StorageError> {
+        let Some(message) = self.outbound_messages.get_mut(&metadata.message_id) else {
+            return Ok(false);
+        };
+        message.metadata = metadata.clone();
+        Ok(true)
+    }
+
+    fn remove_outbound_message(&mut self, message_id: &[u8; 32]) -> Result<bool, StorageError> {
+        Ok(self.outbound_messages.remove(message_id).is_some())
+    }
+
+    fn outbound_count(&self, deferred: Option<bool>) -> Result<usize, StorageError> {
+        Ok(self
+            .outbound_messages
+            .values()
+            .filter(|message| deferred.is_none_or(|value| message.metadata.deferred == value))
+            .count())
+    }
+}
+
+impl StoredOutboundMetadata {
+    fn metadata_order_key(&self) -> f64 {
+        self.next_delivery_attempt
+    }
 }
 
 fn validate_message(message: &StoredMessage) -> Result<(), StorageError> {
@@ -565,6 +708,63 @@ mod tests {
         assert_eq!(storage.message_store_stats().unwrap().payload_size, 50);
     }
 
+    fn outbound_contract(storage: &mut dyn LxmfStorage) {
+        let first = StoredOutboundMessage {
+            metadata: StoredOutboundMetadata {
+                message_id: [0x41; 32],
+                destination_hash: [0x51; 16],
+                state: 1,
+                delivery_method: 2,
+                deferred: false,
+                next_delivery_attempt: 100.5,
+                last_delivery_attempt: 90.25,
+                delivery_attempts: 2,
+                created_at: 50.0,
+                progress: 0.25,
+            },
+            encoded_message: vec![0x61; 64],
+        };
+        let mut deferred = first.clone();
+        deferred.metadata.message_id = [0x42; 32];
+        deferred.metadata.deferred = true;
+        deferred.metadata.next_delivery_attempt = 0.0;
+        deferred.encoded_message = vec![0x62; 32];
+        storage.upsert_outbound_message(&first).unwrap();
+        storage.upsert_outbound_message(&deferred).unwrap();
+
+        assert_eq!(storage.outbound_count(None).unwrap(), 2);
+        assert_eq!(storage.outbound_count(Some(false)).unwrap(), 1);
+        assert!(storage.outbound_ready(100.0, false, 8).unwrap().is_empty());
+        assert_eq!(
+            storage.outbound_ready(101.0, false, 8).unwrap(),
+            vec![first.metadata.clone()]
+        );
+        assert_eq!(
+            storage.outbound_ready(1.0, true, 8).unwrap(),
+            vec![deferred.metadata.clone()]
+        );
+        assert_eq!(
+            storage.outbound_message(&[0x41; 32]).unwrap(),
+            Some(first.clone())
+        );
+
+        let mut updated = first.metadata.clone();
+        updated.delivery_attempts = 3;
+        updated.progress = 0.75;
+        updated.next_delivery_attempt = 200.0;
+        assert!(storage.update_outbound_delivery(&updated).unwrap());
+        assert_eq!(
+            storage
+                .outbound_message(&[0x41; 32])
+                .unwrap()
+                .unwrap()
+                .metadata,
+            updated
+        );
+        assert!(storage.remove_outbound_message(&[0x41; 32]).unwrap());
+        assert!(!storage.remove_outbound_message(&[0x41; 32]).unwrap());
+    }
+
     #[test]
     fn memory_storage_contract() {
         let mut storage = MemoryStorage::new();
@@ -572,6 +772,8 @@ mod tests {
         message_contract(&mut storage);
         let mut weighted_storage = MemoryStorage::new();
         weighted_culling_contract(&mut weighted_storage);
+        let mut outbound_storage = MemoryStorage::new();
+        outbound_contract(&mut outbound_storage);
     }
 
     #[cfg(feature = "sqlite")]
@@ -585,6 +787,9 @@ mod tests {
         let weighted_path = directory.path().join("weighted.sqlite");
         let mut weighted_storage = SqliteStorage::open(&weighted_path).unwrap();
         weighted_culling_contract(&mut weighted_storage);
+        let outbound_path = directory.path().join("outbound.sqlite");
+        let mut outbound_storage = SqliteStorage::open(&outbound_path).unwrap();
+        outbound_contract(&mut outbound_storage);
 
         storage
             .upsert_transient_id(TransientIdKind::LocallyDelivered, [0x44; 32], 300)
@@ -596,7 +801,7 @@ mod tests {
                 .contains_transient_id(TransientIdKind::LocallyDelivered, &[0x44; 32])
                 .unwrap()
         );
-        assert_eq!(reopened.schema_version().unwrap(), 2);
+        assert_eq!(reopened.schema_version().unwrap(), 3);
         assert_eq!(reopened.message_store_stats().unwrap().count, 1);
     }
 }

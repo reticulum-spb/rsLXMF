@@ -134,6 +134,57 @@ pub struct LxMessage {
 }
 
 impl LxMessage {
+    /// Stable, versioned representation for durable outbound queues. Delivery
+    /// scheduling fields live in separate storage columns and are restored by
+    /// the router after decoding.
+    pub fn encode_outbound_storage(&self) -> Result<Vec<u8>, MessageError> {
+        let envelope = OutboundStorageEnvelopeV1 {
+            version: 1,
+            container: self.pack_container()?,
+            propagation_stamp: self.propagation_stamp.map(|stamp| stamp.to_vec()),
+            ratchet_id: self.ratchet_id.map(|ratchet| ratchet.to_vec()),
+            stamp_cost: self.stamp_cost,
+            outbound_ticket: self.outbound_ticket.map(|ticket| ticket.to_vec()),
+            stamp_value: self.stamp_value,
+            representation: self.representation as u8,
+            auto_compress: self.auto_compress,
+        };
+        rmp_serde::to_vec_named(&envelope)
+            .map_err(|error| MessageError::PackFailed(error.to_string()))
+    }
+
+    pub fn decode_outbound_storage(data: &[u8]) -> Result<Self, MessageError> {
+        let envelope: OutboundStorageEnvelopeV1 = rmp_serde::from_slice(data)
+            .map_err(|error| MessageError::UnpackFailed(error.to_string()))?;
+        if envelope.version != 1 {
+            return Err(MessageError::UnpackFailed(format!(
+                "unsupported outbound storage version {}",
+                envelope.version
+            )));
+        }
+        let mut message = Self::unpack_container(&envelope.container)?;
+        message.propagation_stamp =
+            decode_optional_fixed(envelope.propagation_stamp, "propagation stamp")?;
+        message.ratchet_id = decode_optional_fixed(envelope.ratchet_id, "ratchet ID")?;
+        message.stamp_cost = envelope.stamp_cost;
+        message.outbound_ticket =
+            decode_optional_fixed(envelope.outbound_ticket, "outbound ticket")?;
+        message.stamp_value = envelope.stamp_value;
+        message.representation = match envelope.representation {
+            0x00 => DeliveryRepresentation::Unknown,
+            0x01 => DeliveryRepresentation::Packet,
+            0x02 => DeliveryRepresentation::Resource,
+            0x05 => DeliveryRepresentation::Paper,
+            value => {
+                return Err(MessageError::UnpackFailed(format!(
+                    "invalid delivery representation {value}"
+                )));
+            }
+        };
+        message.auto_compress = envelope.auto_compress;
+        Ok(message)
+    }
+
     /// Construct a new outbound message.
     pub fn new(
         destination_hash: [u8; 16],
@@ -1093,6 +1144,39 @@ struct MessageContainer {
     method: u8,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OutboundStorageEnvelopeV1 {
+    version: u8,
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_bytes"
+    )]
+    container: Vec<u8>,
+    propagation_stamp: Option<Vec<u8>>,
+    ratchet_id: Option<Vec<u8>>,
+    stamp_cost: Option<u8>,
+    outbound_ticket: Option<Vec<u8>>,
+    stamp_value: Option<u16>,
+    representation: u8,
+    auto_compress: bool,
+}
+
+fn decode_optional_fixed<const N: usize>(
+    value: Option<Vec<u8>>,
+    name: &str,
+) -> Result<Option<[u8; N]>, MessageError> {
+    value
+        .map(|bytes| {
+            bytes.try_into().map_err(|bytes: Vec<u8>| {
+                MessageError::UnpackFailed(format!(
+                    "invalid {name} length {}, expected {N}",
+                    bytes.len()
+                ))
+            })
+        })
+        .transpose()
+}
+
 fn serialize_bytes<S: serde::Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_bytes(data)
 }
@@ -2045,6 +2129,46 @@ mod tests {
         assert_eq!(unpacked.transport_encryption.as_deref(), Some("Curve25519"));
         assert_eq!(unpacked.title, "Container Test");
         assert_eq!(unpacked.content, "Content for container");
+    }
+
+    #[test]
+    fn outbound_storage_encoding_preserves_non_wire_fields() {
+        let mut message = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "durable",
+            "outbound",
+            DeliveryMethod::Direct,
+        );
+        message
+            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::generate())
+            .unwrap();
+        message.state = MessageState::Outbound;
+        message.method = DeliveryMethod::Propagated;
+        message.propagation_stamp = Some([0x11; 32]);
+        message.ratchet_id = Some([0x22; 32]);
+        message.stamp_cost = Some(7);
+        message.outbound_ticket = Some([0x33; 16]);
+        message.stamp_value = Some(9);
+        message.representation = DeliveryRepresentation::Resource;
+        message.auto_compress = false;
+
+        let decoded =
+            LxMessage::decode_outbound_storage(&message.encode_outbound_storage().unwrap())
+                .unwrap();
+        assert_eq!(decoded.destination_hash, message.destination_hash);
+        assert_eq!(decoded.source_hash, message.source_hash);
+        assert_eq!(decoded.title, message.title);
+        assert_eq!(decoded.content, message.content);
+        assert_eq!(decoded.state, MessageState::Outbound);
+        assert_eq!(decoded.method, DeliveryMethod::Propagated);
+        assert_eq!(decoded.propagation_stamp, Some([0x11; 32]));
+        assert_eq!(decoded.ratchet_id, Some([0x22; 32]));
+        assert_eq!(decoded.stamp_cost, Some(7));
+        assert_eq!(decoded.outbound_ticket, Some([0x33; 16]));
+        assert_eq!(decoded.stamp_value, Some(9));
+        assert_eq!(decoded.representation, DeliveryRepresentation::Resource);
+        assert!(!decoded.auto_compress);
     }
 
     #[test]

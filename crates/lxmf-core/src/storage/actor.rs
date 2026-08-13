@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use super::{
     LxmfStorage, MessageStoreStats, StorageError, StoredMessage, StoredMessageMetadata,
-    TransientIdKind,
+    StoredOutboundMessage, StoredOutboundMetadata, TransientIdKind,
 };
 use crate::types::PropagationTransientId;
 
@@ -238,6 +238,56 @@ impl LxmfStorage for StorageHandle {
                 limit,
             )
         })
+    }
+
+    fn upsert_outbound_message(
+        &mut self,
+        message: &StoredOutboundMessage,
+    ) -> Result<(), StorageError> {
+        let message = message.clone();
+        self.call(move |storage| storage.upsert_outbound_message(&message))
+    }
+
+    fn outbound_message(
+        &self,
+        message_id: &[u8; 32],
+    ) -> Result<Option<StoredOutboundMessage>, StorageError> {
+        let message_id = *message_id;
+        self.call(move |storage| storage.outbound_message(&message_id))
+    }
+
+    fn outbound_ready(
+        &self,
+        now: f64,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError> {
+        self.call(move |storage| storage.outbound_ready(now, deferred, limit))
+    }
+
+    fn outbound_metadata_page(
+        &self,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError> {
+        self.call(move |storage| storage.outbound_metadata_page(deferred, limit))
+    }
+
+    fn update_outbound_delivery(
+        &mut self,
+        metadata: &StoredOutboundMetadata,
+    ) -> Result<bool, StorageError> {
+        let metadata = metadata.clone();
+        self.call(move |storage| storage.update_outbound_delivery(&metadata))
+    }
+
+    fn remove_outbound_message(&mut self, message_id: &[u8; 32]) -> Result<bool, StorageError> {
+        let message_id = *message_id;
+        self.call(move |storage| storage.remove_outbound_message(&message_id))
+    }
+
+    fn outbound_count(&self, deferred: Option<bool>) -> Result<usize, StorageError> {
+        self.call(move |storage| storage.outbound_count(deferred))
     }
 }
 

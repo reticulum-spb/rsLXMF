@@ -4,11 +4,11 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::V
 
 use super::{
     LxmfStorage, MessageStoreStats, StorageError, StoredMessage, StoredMessageMetadata,
-    TransientIdKind, validate_message,
+    StoredOutboundMessage, StoredOutboundMetadata, TransientIdKind, validate_message,
 };
 use crate::types::PropagationTransientId;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 pub struct SqliteStorage {
     connection: Connection,
@@ -347,6 +347,179 @@ impl LxmfStorage for SqliteStorage {
         transaction.commit().map_err(database_error)?;
         Ok(selected.len())
     }
+
+    fn upsert_outbound_message(
+        &mut self,
+        message: &StoredOutboundMessage,
+    ) -> Result<(), StorageError> {
+        let metadata = &message.metadata;
+        self.connection
+            .execute(
+                "INSERT INTO outbound_messages(
+                     message_id, destination_hash, state, delivery_method, deferred,
+                     next_delivery_attempt, last_delivery_attempt, delivery_attempts,
+                     created_at, progress, encoded_message
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                     destination_hash = excluded.destination_hash,
+                     state = excluded.state,
+                     delivery_method = excluded.delivery_method,
+                     deferred = excluded.deferred,
+                     next_delivery_attempt = excluded.next_delivery_attempt,
+                     last_delivery_attempt = excluded.last_delivery_attempt,
+                     delivery_attempts = excluded.delivery_attempts,
+                     created_at = excluded.created_at,
+                     progress = excluded.progress,
+                     encoded_message = excluded.encoded_message",
+                params![
+                    metadata.message_id.as_slice(),
+                    metadata.destination_hash.as_slice(),
+                    i64::from(metadata.state),
+                    i64::from(metadata.delivery_method),
+                    i64::from(metadata.deferred),
+                    metadata.next_delivery_attempt,
+                    metadata.last_delivery_attempt,
+                    i64::from(metadata.delivery_attempts),
+                    metadata.created_at,
+                    metadata.progress,
+                    message.encoded_message,
+                ],
+            )
+            .map(|_| ())
+            .map_err(database_error)
+    }
+
+    fn outbound_message(
+        &self,
+        message_id: &[u8; 32],
+    ) -> Result<Option<StoredOutboundMessage>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT message_id, destination_hash, state, delivery_method, deferred,
+                        next_delivery_attempt, last_delivery_attempt, delivery_attempts,
+                        created_at, progress, encoded_message
+                 FROM outbound_messages WHERE message_id = ?1",
+                [message_id.as_slice()],
+                |row| {
+                    Ok(StoredOutboundMessage {
+                        metadata: outbound_metadata_from_row(row)?,
+                        encoded_message: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    fn outbound_ready(
+        &self,
+        now: f64,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_id, destination_hash, state, delivery_method, deferred,
+                        next_delivery_attempt, last_delivery_attempt, delivery_attempts,
+                        created_at, progress
+                 FROM outbound_messages
+                 WHERE deferred = ?1 AND next_delivery_attempt <= ?2
+                 ORDER BY next_delivery_attempt, created_at, message_id LIMIT ?3",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map(
+                params![i64::from(deferred), now, usize_to_i64(limit)?],
+                outbound_metadata_from_row,
+            )
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    fn outbound_metadata_page(
+        &self,
+        deferred: bool,
+        limit: usize,
+    ) -> Result<Vec<StoredOutboundMetadata>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT message_id, destination_hash, state, delivery_method, deferred,
+                        next_delivery_attempt, last_delivery_attempt, delivery_attempts,
+                        created_at, progress
+                 FROM outbound_messages WHERE deferred = ?1
+                 ORDER BY created_at, message_id LIMIT ?2",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map(
+                params![i64::from(deferred), usize_to_i64(limit)?],
+                outbound_metadata_from_row,
+            )
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    fn update_outbound_delivery(
+        &mut self,
+        metadata: &StoredOutboundMetadata,
+    ) -> Result<bool, StorageError> {
+        self.connection
+            .execute(
+                "UPDATE outbound_messages SET
+                     destination_hash = ?2, state = ?3, delivery_method = ?4,
+                     deferred = ?5, next_delivery_attempt = ?6,
+                     last_delivery_attempt = ?7, delivery_attempts = ?8,
+                     created_at = ?9, progress = ?10
+                 WHERE message_id = ?1",
+                params![
+                    metadata.message_id.as_slice(),
+                    metadata.destination_hash.as_slice(),
+                    i64::from(metadata.state),
+                    i64::from(metadata.delivery_method),
+                    i64::from(metadata.deferred),
+                    metadata.next_delivery_attempt,
+                    metadata.last_delivery_attempt,
+                    i64::from(metadata.delivery_attempts),
+                    metadata.created_at,
+                    metadata.progress,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(database_error)
+    }
+
+    fn remove_outbound_message(&mut self, message_id: &[u8; 32]) -> Result<bool, StorageError> {
+        self.connection
+            .execute(
+                "DELETE FROM outbound_messages WHERE message_id = ?1",
+                [message_id.as_slice()],
+            )
+            .map(|changed| changed == 1)
+            .map_err(database_error)
+    }
+
+    fn outbound_count(&self, deferred: Option<bool>) -> Result<usize, StorageError> {
+        let count = if let Some(deferred) = deferred {
+            self.connection
+                .query_row(
+                    "SELECT COUNT(*) FROM outbound_messages WHERE deferred = ?1",
+                    [i64::from(deferred)],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(database_error)?
+        } else {
+            self.connection
+                .query_row("SELECT COUNT(*) FROM outbound_messages", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(database_error)?
+        };
+        i64_to_usize(count, "outbound count")
+    }
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
@@ -402,6 +575,33 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
                      ON messages(destination_hash, stored_at);
                  CREATE INDEX messages_stored_at ON messages(stored_at);
                  INSERT INTO schema_meta(key, value) VALUES ('schema_version', '2')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+    }
+    if found < 3 {
+        let transaction = connection.transaction().map_err(database_error)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE outbound_messages (
+                     message_id            BLOB PRIMARY KEY CHECK(length(message_id) = 32),
+                     destination_hash      BLOB NOT NULL CHECK(length(destination_hash) = 16),
+                     state                 INTEGER NOT NULL,
+                     delivery_method       INTEGER NOT NULL,
+                     deferred              INTEGER NOT NULL,
+                     next_delivery_attempt REAL NOT NULL,
+                     last_delivery_attempt REAL NOT NULL,
+                     delivery_attempts     INTEGER NOT NULL,
+                     created_at            REAL NOT NULL,
+                     progress              REAL NOT NULL,
+                     encoded_message       BLOB NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE INDEX outbound_ready
+                     ON outbound_messages(state, next_delivery_attempt);
+                 CREATE INDEX outbound_deferred_ready
+                     ON outbound_messages(deferred, next_delivery_attempt);
+                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', '3')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
             )
             .map_err(database_error)?;
@@ -464,6 +664,42 @@ fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessageM
     })
 }
 
+fn outbound_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOutboundMetadata> {
+    let state = u8::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    let delivery_method = u8::try_from(row.get::<_, i64>(3)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    let delivery_attempts = u32::try_from(row.get::<_, i64>(7)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            7,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    Ok(StoredOutboundMetadata {
+        message_id: fixed_blob::<32>(row.get(0)?, 0)?,
+        destination_hash: fixed_blob::<16>(row.get(1)?, 1)?,
+        state,
+        delivery_method,
+        deferred: row.get::<_, i64>(4)? != 0,
+        next_delivery_attempt: row.get(5)?,
+        last_delivery_attempt: row.get(6)?,
+        delivery_attempts,
+        created_at: row.get(8)?,
+        progress: row.get(9)?,
+    })
+}
+
 fn fixed_blob<const N: usize>(value: Vec<u8>, column: usize) -> rusqlite::Result<[u8; N]> {
     value.try_into().map_err(|value: Vec<u8>| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -516,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_database_to_messages_schema() {
+    fn migrates_v1_database_to_current_schema() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("v1.sqlite");
         let connection = Connection::open(&path).unwrap();
@@ -539,7 +775,7 @@ mod tests {
         drop(connection);
 
         let mut storage = SqliteStorage::open(&path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 2);
+        assert_eq!(storage.schema_version().unwrap(), 3);
         assert_eq!(storage.message_store_stats().unwrap().count, 0);
         assert!(
             storage
@@ -554,6 +790,46 @@ mod tests {
                 ))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn creates_outbound_table_and_ready_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SqliteStorage::open(&directory.path().join("outbound.sqlite")).unwrap();
+
+        storage
+            .connection
+            .execute(
+                "INSERT INTO outbound_messages(
+                     message_id, destination_hash, state, delivery_method, deferred,
+                     next_delivery_attempt, last_delivery_attempt, delivery_attempts,
+                     created_at, progress, encoded_message
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    [0x11_u8; 32].as_slice(),
+                    [0x22_u8; 16].as_slice(),
+                    1_i64,
+                    2_i64,
+                    0_i64,
+                    100.0_f64,
+                    0.0_f64,
+                    0_i64,
+                    50.0_f64,
+                    0.0_f64,
+                    [0x33_u8; 8].as_slice(),
+                ],
+            )
+            .unwrap();
+
+        let index_sql: String = storage
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'outbound_ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_sql.contains("state, next_delivery_attempt"));
     }
 
     #[test]

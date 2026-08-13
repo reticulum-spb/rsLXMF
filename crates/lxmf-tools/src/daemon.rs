@@ -361,7 +361,7 @@ pub fn create_router_with_sqlite(
 ) -> Result<(LxmRouter, StorageHandle), StorageError> {
     let storage = spawn_sqlite_storage_actor(database_path.to_path_buf())?;
     let mut router =
-        LxmRouter::with_storage_backend(config.to_router_config(), Box::new(storage.clone()));
+        LxmRouter::with_shared_storage_backend(config.to_router_config(), storage.clone());
     router.set_transport(transport_tx);
     Ok((router, storage))
 }
