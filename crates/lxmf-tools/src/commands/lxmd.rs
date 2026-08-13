@@ -1990,8 +1990,8 @@ impl LxmdRunner {
         false
     }
 
-    /// Write a received LXMF message to disk and invoke `on_inbound`.
-    fn handle_inbound_message(&self, msg: LxMessage) {
+    /// Store a received message in SQLite and invoke `on_inbound` with JSON.
+    fn handle_inbound_message(&mut self, msg: LxMessage) {
         // Also deposit into the propagation store (if enabled) so peers can
         // download it via offer/get sync.
         if let Some(ref pn) = self.propagation_node
@@ -2004,41 +2004,57 @@ impl LxmdRunner {
             );
         }
 
-        let messages_dir = self.messages_dir.clone();
-        std::fs::create_dir_all(&messages_dir).ok();
-
-        let msg_hash = msg
-            .hash
-            .map(hex::encode)
-            .unwrap_or_else(|| format!("{:.0}", now_f64()));
-        let msg_path = messages_dir.join(format!("{msg_hash}.lxm"));
-
-        // Pack synchronously (CPU-bound, no IO) and offload the disk write
-        // to the blocking pool so a slow disk doesn't stall the lxmd runner
-        // task between inbound messages. Atomic tmp+rename write so readers
-        // never see a partial file (LXMessage.py:674-696).
-        match msg.pack() {
-            Ok(packed) => {
-                let write_path = msg_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = lxmf_core::persist::write_file_atomic(&write_path, &packed) {
-                        tracing::error!("failed to write message to {}: {e}", write_path.display());
-                    } else {
-                        tracing::info!("message saved to {}", write_path.display());
-                    }
-                });
-            }
+        let packed = match msg.pack() {
+            Ok(packed) => packed,
             Err(e) => {
                 tracing::error!("failed to pack message for storage: {e}");
                 return;
             }
+        };
+        let message_id = msg
+            .message_id
+            .or(msg.hash)
+            .unwrap_or_else(|| rns_crypto::sha::sha256(&packed));
+        if let Err(error) = self.router.store_inbound_message(message_id, &packed) {
+            tracing::error!(%error, "failed to persist inbound message");
+            return;
         }
 
-        // Execute on_inbound command if configured
-        if let Some(ref cmd) = self.config.on_inbound_command
-            && let Err(e) = execute_on_inbound(cmd, &msg_path.to_string_lossy())
-        {
-            tracing::error!("on_inbound command failed: {e}");
+        if let Some(ref cmd) = self.config.on_inbound_command {
+            use base64::Engine;
+            let fields = msg
+                .fields
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.to_string(),
+                        serde_json::Value::String(
+                            base64::engine::general_purpose::STANDARD.encode(value),
+                        ),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let envelope = serde_json::json!({
+                "version": 1,
+                "message_id": hex::encode(message_id),
+                "source_hash": hex::encode(msg.source_hash),
+                "destination_hash": hex::encode(msg.destination_hash),
+                "timestamp": msg.timestamp,
+                "title": msg.title,
+                "content": msg.content,
+                "fields": fields,
+                "delivery_method": msg.method as u8,
+                "state": msg.state as u8,
+                "stamp": msg.stamp.as_ref().map(|value| base64::engine::general_purpose::STANDARD.encode(value)),
+            });
+            match serde_json::to_vec(&envelope) {
+                Ok(json) => {
+                    if let Err(error) = execute_on_inbound(cmd, &json) {
+                        tracing::error!(%error, "on_inbound command failed");
+                    }
+                }
+                Err(error) => tracing::error!(%error, "failed to encode on_inbound JSON"),
+            }
         }
 
         // Update known identity from sender

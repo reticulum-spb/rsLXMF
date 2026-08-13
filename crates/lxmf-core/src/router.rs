@@ -474,6 +474,19 @@ impl LxmRouter {
             .cull_ratchets_before(cutoff)
             .unwrap_or_default()
     }
+    pub fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        self.storage.put_state_blob(key, value)
+    }
+    pub fn state_blob(&self, key: &str) -> Option<Vec<u8>> {
+        self.storage.state_blob(key).ok().flatten()
+    }
+    pub fn store_inbound_message(
+        &mut self,
+        id: [u8; 32],
+        encoded: &[u8],
+    ) -> Result<(), StorageError> {
+        self.storage.insert_inbound_message(id, now_f64(), encoded)
+    }
 
     fn persist_outbound_message(&mut self, message: &LxMessage, deferred: bool) -> bool {
         let Some(message_id) = message.message_id.or(message.hash) else {

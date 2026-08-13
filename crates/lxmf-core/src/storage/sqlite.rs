@@ -9,7 +9,7 @@ use super::{
 };
 use crate::types::PropagationTransientId;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 pub struct SqliteStorage {
     connection: Connection,
@@ -640,6 +640,25 @@ impl LxmfStorage for SqliteStorage {
             )
             .map_err(database_error)
     }
+    fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        self.connection.execute("INSERT INTO state_blobs(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map(|_|()).map_err(database_error)
+    }
+    fn state_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        self.connection
+            .query_row("SELECT value FROM state_blobs WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(database_error)
+    }
+    fn insert_inbound_message(
+        &mut self,
+        id: [u8; 32],
+        at: f64,
+        encoded: &[u8],
+    ) -> Result<(), StorageError> {
+        self.connection.execute("INSERT OR IGNORE INTO inbound_messages(message_id,received_at,encoded_message) VALUES(?1,?2,?3)",params![id.as_slice(),at,encoded]).map(|_|()).map_err(database_error)
+    }
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
@@ -750,6 +769,11 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
     if found < 5 {
         let transaction = connection.transaction().map_err(database_error)?;
         transaction.execute_batch("CREATE TABLE identities(destination_hash BLOB PRIMARY KEY CHECK(length(destination_hash)=16),public_key BLOB NOT NULL CHECK(length(public_key)=64),updated_at REAL NOT NULL) WITHOUT ROWID; CREATE INDEX identities_updated ON identities(updated_at); CREATE TABLE received_ratchets(destination_hash BLOB PRIMARY KEY CHECK(length(destination_hash)=16),ratchet_key BLOB NOT NULL CHECK(length(ratchet_key)=32),received_at REAL NOT NULL) WITHOUT ROWID; CREATE INDEX ratchets_received ON received_ratchets(received_at); INSERT INTO schema_meta(key,value) VALUES('schema_version','5') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+    }
+    if found < 6 {
+        let transaction = connection.transaction().map_err(database_error)?;
+        transaction.execute_batch("CREATE TABLE state_blobs(key TEXT PRIMARY KEY,value BLOB NOT NULL) WITHOUT ROWID; CREATE TABLE inbound_messages(message_id BLOB PRIMARY KEY CHECK(length(message_id)=32),received_at REAL NOT NULL,encoded_message BLOB NOT NULL) WITHOUT ROWID; CREATE INDEX inbound_received ON inbound_messages(received_at); INSERT INTO schema_meta(key,value) VALUES('schema_version','6') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(database_error)?;
         transaction.commit().map_err(database_error)?;
     }
     Ok(())
@@ -920,7 +944,7 @@ mod tests {
         drop(connection);
 
         let mut storage = SqliteStorage::open(&path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 5);
+        assert_eq!(storage.schema_version().unwrap(), 6);
         assert_eq!(storage.message_store_stats().unwrap().count, 0);
         assert!(
             storage

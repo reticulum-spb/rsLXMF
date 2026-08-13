@@ -353,6 +353,24 @@ impl LxmfStorage for StorageHandle {
     fn cull_ratchets_before(&mut self, cutoff: f64) -> Result<usize, StorageError> {
         self.call(move |s| s.cull_ratchets_before(cutoff))
     }
+    fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        let key = key.to_string();
+        let value = value.to_vec();
+        self.call(move |s| s.put_state_blob(&key, &value))
+    }
+    fn state_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let key = key.to_string();
+        self.call(move |s| s.state_blob(&key))
+    }
+    fn insert_inbound_message(
+        &mut self,
+        id: [u8; 32],
+        at: f64,
+        encoded: &[u8],
+    ) -> Result<(), StorageError> {
+        let encoded = encoded.to_vec();
+        self.call(move |s| s.insert_inbound_message(id, at, &encoded))
+    }
 }
 
 #[cfg(test)]

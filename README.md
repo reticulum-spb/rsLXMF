@@ -224,7 +224,12 @@ Run an inbound hook:
 lxmd-rs --config ~/.rsLXMF --rnsconfig ~/.rsReticulum --on-inbound /path/to/handler
 ```
 
-The handler receives the saved `.lxm` message path as an argument.
+The handler receives a versioned JSON object on standard input. No argument is
+added and no `.lxm` file is created. Version 1 contains `message_id`,
+`source_hash`, `destination_hash`, `timestamp`, `title`, `content`, numeric
+`delivery_method` and `state`, optional base64 `stamp`, and a `fields` object
+whose values are base64 strings. The message is durably stored in SQLite before
+the handler is started. A non-zero handler exit status is logged.
 
 ## Configuration
 

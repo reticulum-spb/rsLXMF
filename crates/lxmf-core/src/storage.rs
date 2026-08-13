@@ -270,6 +270,14 @@ pub trait LxmfStorage: Send {
     fn ratchet(&self, destination_hash: &[u8; 16]) -> Result<Option<StoredRatchet>, StorageError>;
     fn ratchet_page(&self, cutoff: f64, limit: usize) -> Result<Vec<StoredRatchet>, StorageError>;
     fn cull_ratchets_before(&mut self, cutoff: f64) -> Result<usize, StorageError>;
+    fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError>;
+    fn state_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
+    fn insert_inbound_message(
+        &mut self,
+        message_id: [u8; 32],
+        received_at: f64,
+        encoded: &[u8],
+    ) -> Result<(), StorageError>;
 }
 
 #[derive(Debug, Default)]
@@ -281,6 +289,8 @@ pub struct MemoryStorage {
     stamp_costs: HashMap<[u8; 16], StoredStampCost>,
     identities: HashMap<[u8; 16], StoredIdentity>,
     ratchets: HashMap<[u8; 16], StoredRatchet>,
+    state_blobs: HashMap<String, Vec<u8>>,
+    inbound_messages: HashMap<[u8; 32], (f64, Vec<u8>)>,
 }
 
 impl MemoryStorage {
@@ -669,6 +679,22 @@ impl LxmfStorage for MemoryStorage {
         self.ratchets.retain(|_, r| r.received_at >= cutoff);
         Ok(before - self.ratchets.len())
     }
+    fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        self.state_blobs.insert(key.to_string(), value.to_vec());
+        Ok(())
+    }
+    fn state_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.state_blobs.get(key).cloned())
+    }
+    fn insert_inbound_message(
+        &mut self,
+        id: [u8; 32],
+        at: f64,
+        encoded: &[u8],
+    ) -> Result<(), StorageError> {
+        self.inbound_messages.insert(id, (at, encoded.to_vec()));
+        Ok(())
+    }
 }
 
 impl StoredOutboundMetadata {
@@ -1011,7 +1037,7 @@ mod tests {
                 .contains_transient_id(TransientIdKind::LocallyDelivered, &[0x44; 32])
                 .unwrap()
         );
-        assert_eq!(reopened.schema_version().unwrap(), 5);
+        assert_eq!(reopened.schema_version().unwrap(), 6);
         assert_eq!(reopened.message_store_stats().unwrap().count, 1);
     }
 }

@@ -366,13 +366,10 @@ pub fn create_router_with_sqlite(
     Ok((router, storage))
 }
 
-/// Execute an on_inbound hook.
-///
-/// Runs `Command::new(prog).arg(...)` with `message_path` as a separate
-/// argument rather than interpolating into a shell string, so untrusted path
-/// contents cannot inject shell metacharacters.
-pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<()> {
-    use std::process::Command;
+/// Execute an `on_inbound` hook with a versioned JSON envelope on stdin.
+pub fn execute_on_inbound(command: &str, json: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     let parts: Vec<&str> = command.split_whitespace().collect();
     if parts.is_empty() {
@@ -383,9 +380,10 @@ pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<
     for arg in &parts[1..] {
         cmd.arg(arg);
     }
-    cmd.arg(message_path);
-
-    let status = cmd.status()?;
+    cmd.stdin(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    child.stdin.take().expect("piped stdin").write_all(json)?;
+    let status = child.wait()?;
     if !status.success() {
         tracing::warn!("on_inbound command exited with status: {}", status);
     }
@@ -395,6 +393,22 @@ pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_inbound_receives_json_on_stdin_without_path_argument() {
+        let output = std::env::temp_dir().join(format!(
+            "lxmf-on-inbound-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let json = br#"{"version":1,"content":"hello"}"#;
+        execute_on_inbound(&format!("tee {}", output.display()), json).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), json);
+        let _ = std::fs::remove_file(output);
+    }
 
     #[test]
     fn test_default_config() {
