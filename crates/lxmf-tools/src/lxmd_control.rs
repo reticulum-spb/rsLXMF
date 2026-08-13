@@ -168,31 +168,26 @@ pub fn encode_router_control_stats(
     node: Option<&PropagationNode>,
     now: f64,
 ) -> Vec<u8> {
+    let stats = router
+        .control_status_at(now)
+        .expect("control stats require propagation to be enabled");
     let message_count = node
         .map(PropagationNode::message_count)
-        .unwrap_or_else(|| router.propagation_store.len());
+        .unwrap_or(stats.message_count);
     let message_size = node
         .map(PropagationNode::total_size)
-        .unwrap_or_else(|| router.propagation_store.total_size());
-    let storage_limit = router.config.ext.message_storage_limit;
+        .unwrap_or(stats.message_size);
+    let storage_limit = stats.storage_limit;
 
     let mut peer_entries = Vec::new();
-    for (hash, peer) in &router.peers {
-        let peer_type = if router.static_peers.contains(hash) || peer.is_static {
-            "static"
-        } else {
-            "discovered"
-        };
+    for (hash, peer) in &stats.peer_stats {
+        let peer_type = peer.peer_type.as_str();
         let acceptance_rate = if peer.offered == 0 {
             0.0
         } else {
             peer.outgoing as f64 / peer.offered as f64
         };
-        let peering_key_value = peer
-            .peering_key
-            .as_ref()
-            .map(|(_, value)| Value::from(*value as u64))
-            .unwrap_or(Value::Nil);
+        let peering_key_value = peer.peering_key.map(Value::from).unwrap_or(Value::Nil);
 
         let peer_map = Value::Map(vec![
             (Value::String("type".into()), Value::from(peer_type)),
@@ -232,11 +227,11 @@ pub fn encode_router_control_stats(
             ),
             (
                 Value::String("transfer_limit".into()),
-                option_f64(peer.propagation_transfer_limit),
+                option_f64(peer.transfer_limit),
             ),
             (
                 Value::String("sync_limit".into()),
-                option_f64(peer.propagation_sync_limit),
+                option_f64(peer.sync_limit),
             ),
             (
                 Value::String("target_stamp_cost".into()),
@@ -269,7 +264,7 @@ pub fn encode_router_control_stats(
                     (Value::String("incoming".into()), Value::from(peer.incoming)),
                     (
                         Value::String("unhandled".into()),
-                        Value::from(peer.unhandled_messages() as u64),
+                        Value::from(peer.unhandled as u64),
                     ),
                 ]),
             ),
@@ -277,16 +272,13 @@ pub fn encode_router_control_stats(
         peer_entries.push((Value::Binary(hash.to_vec()), peer_map));
     }
 
-    let static_peers = router
-        .peers
-        .keys()
-        .filter(|hash| router.static_peers.contains(hash))
+    let static_peers = stats
+        .peer_stats
+        .values()
+        .filter(|peer| peer.peer_type == "static")
         .count();
-    let discovered_peers = router.peers.len().saturating_sub(static_peers);
-    let uptime = router
-        .propagation_start_time
-        .map(|started| now - started)
-        .unwrap_or(0.0);
+    let discovered_peers = stats.total_peers.saturating_sub(static_peers);
+    let uptime = stats.uptime;
 
     let stats = Value::Map(vec![
         (
@@ -300,39 +292,39 @@ pub fn encode_router_control_stats(
         (Value::String("uptime".into()), Value::F64(uptime)),
         (
             Value::String("delivery_limit".into()),
-            Value::from(router.config.delivery_limit_kb as u64),
+            Value::from(stats.delivery_limit as u64),
         ),
         (
             Value::String("propagation_limit".into()),
-            Value::from(router.config.propagation_limit_kb as u64),
+            Value::from(stats.propagation_limit as u64),
         ),
         (
             Value::String("sync_limit".into()),
-            Value::from(router.config.sync_limit_kb as u64),
+            Value::from(stats.sync_limit as u64),
         ),
         (
             Value::String("target_stamp_cost".into()),
-            Value::from(router.config.propagation_stamp_cost as u64),
+            Value::from(stats.stamp_cost as u64),
         ),
         (
             Value::String("stamp_cost_flexibility".into()),
-            Value::from(router.config.propagation_stamp_flex as u64),
+            Value::from(stats.stamp_flex as u64),
         ),
         (
             Value::String("peering_cost".into()),
-            Value::from(router.config.ext.peering_cost as u64),
+            Value::from(stats.peering_cost as u64),
         ),
         (
             Value::String("max_peering_cost".into()),
-            Value::from(router.config.ext.max_peering_cost as u64),
+            Value::from(stats.max_peering_cost as u64),
         ),
         (
             Value::String("autopeer_maxdepth".into()),
-            Value::from(router.config.ext.autopeer_maxdepth as u64),
+            Value::from(stats.autopeer_maxdepth as u64),
         ),
         (
             Value::String("from_static_only".into()),
-            Value::Boolean(router.config.ext.from_static_only),
+            Value::Boolean(stats.from_static_only),
         ),
         (
             Value::String("messagestore".into()),
@@ -358,21 +350,21 @@ pub fn encode_router_control_stats(
             Value::Map(vec![
                 (
                     Value::String("client_propagation_messages_received".into()),
-                    Value::from(router.client_propagation_messages_received),
+                    Value::from(stats.client_messages_received),
                 ),
                 (
                     Value::String("client_propagation_messages_served".into()),
-                    Value::from(router.client_propagation_messages_served),
+                    Value::from(stats.client_messages_served),
                 ),
             ]),
         ),
         (
             Value::String("unpeered_propagation_incoming".into()),
-            Value::from(router.unpeered_propagation_incoming),
+            Value::from(stats.unpeered_incoming),
         ),
         (
             Value::String("unpeered_propagation_rx_bytes".into()),
-            Value::from(router.unpeered_propagation_rx_bytes),
+            Value::from(stats.unpeered_rx_bytes),
         ),
         (
             Value::String("static_peers".into()),
@@ -384,11 +376,11 @@ pub fn encode_router_control_stats(
         ),
         (
             Value::String("total_peers".into()),
-            Value::from(router.peers.len() as u64),
+            Value::from(stats.total_peers as u64),
         ),
         (
             Value::String("max_peers".into()),
-            Value::from(router.config.max_peers as u64),
+            Value::from(stats.max_peers as u64),
         ),
         (Value::String("peers".into()), Value::Map(peer_entries)),
     ]);
@@ -976,8 +968,8 @@ mod tests {
         peer.offered = 4;
         peer.outgoing = 2;
         peer.set_unhandled_count(1);
-        router.peers.insert(peer_hash, peer);
-        router.static_peers.push(peer_hash);
+        router.add_peer(peer);
+        router.add_static_peer(peer_hash);
 
         let encoded =
             encode_router_control_stats(&router, [0x11; 16], [0x22; 16], None, 1_700_003_600.0);

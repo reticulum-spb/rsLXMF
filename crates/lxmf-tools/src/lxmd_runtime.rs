@@ -14,6 +14,7 @@ pub struct LxmdPaths {
     pub storage_dir: PathBuf,
     pub messages_dir: PathBuf,
     pub lxmf_storage_dir: PathBuf,
+    pub database_path: PathBuf,
     pub router_state_dir: PathBuf,
     pub propagation_store_dir: PathBuf,
     pub ratchets_dir: PathBuf,
@@ -35,6 +36,7 @@ impl LxmdPaths {
         let storage_dir = config_dir.join("storage");
         let messages_dir = storage_dir.join("messages");
         let lxmf_storage_dir = storage_dir.join("lxmf");
+        let database_path = lxmf_storage_dir.join("lxmf.sqlite");
         let router_state_dir = lxmf_storage_dir.clone();
         let propagation_store_dir = lxmf_storage_dir.join("messagestore");
         let ratchets_dir = lxmf_storage_dir.join("ratchets");
@@ -55,6 +57,7 @@ impl LxmdPaths {
             storage_dir,
             messages_dir,
             lxmf_storage_dir,
+            database_path,
             router_state_dir,
             propagation_store_dir,
             ratchets_dir,

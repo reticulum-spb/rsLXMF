@@ -29,12 +29,12 @@
 - [x] Проверить использование этих API в `lxmf-tools` и `examples`.
 - [x] Сопоставить API с уже существующими внешними приложениями.
 - [x] Определить список сигнатур, которые обязательно должны сохраниться.
-- [ ] Для несовместимых с SQLite методов выбрать:
+- [x] Для несовместимых с SQLite методов выбрать:
   - [x] owned return для внутренних point lookup;
-  - [ ] callback/closure API, если потребуется streaming;
+  - [x] callback/closure API пока не требуется; добавить при появлении streaming;
   - [x] ограниченный compatibility cache для старого reference API;
   - [x] deprecated wrapper для full-map/file API.
-- [ ] Добавить compile-time/API regression tests для сохраняемых интерфейсов.
+- [x] Добавить compile-time/API regression tests для сохраняемых интерфейсов.
 
 Результаты аудита: `doc/api.md`.
 
@@ -44,65 +44,66 @@
 читать или изменять коллекции `LxmRouter`, которые позднее перестанут быть
 полным представлением состояния в RAM.
 
-- [ ] Составить полный список прямых обращений `lxmf-tools` к публичным полям
+- [x] Составить полный список прямых обращений `lxmf-tools` к публичным полям
   `LxmRouter`.
-- [ ] Составить полный список прямых обращений daemon к:
-  - [ ] `pending_outbound`;
-  - [ ] `pending_deferred_stamps`;
-  - [ ] `propagation_store`;
-  - [ ] `outbound_stamp_costs`;
-  - [ ] `ticket_store`;
-  - [ ] `peers`;
-  - [ ] policy maps/lists;
-  - [ ] throttled peers;
-  - [ ] внутренним propagation counters/state.
-- [ ] Добавить high-level command methods:
-  - [ ] enqueue/cancel/update outbound message;
-  - [ ] enqueue/cancel/query deferred stamp;
-  - [ ] mark delivery result;
-  - [ ] add/update/remove peer;
-  - [ ] add/remove policy entry;
-  - [ ] add/remove throttle;
-  - [ ] remember/remove ticket и stamp cost.
-- [ ] Добавить high-level read/query methods:
-  - [ ] outbound count и bounded summary;
-  - [ ] propagation count/total size;
-  - [ ] point lookup propagation metadata;
-  - [ ] paginated propagation metadata;
-  - [ ] peer summaries/stats;
-  - [ ] ticket/stamp-cost lookup;
-  - [ ] router/node status snapshot.
-- [ ] Не возвращать из новых методов ссылки на внутренние `HashMap`/`Vec`.
-- [ ] Для списков возвращать owned DTO и использовать обязательный `limit`.
-- [ ] Для больших payload отделить metadata query от payload read.
-- [ ] Добавить отдельные DTO для daemon/control status вместо клонирования
+- [x] Составить полный список прямых обращений daemon к:
+  - [x] `pending_outbound`;
+  - [x] `pending_deferred_stamps`;
+  - [x] `propagation_store`;
+  - [x] `outbound_stamp_costs`;
+  - [x] `ticket_store`;
+  - [x] `peers`;
+  - [x] policy maps/lists;
+  - [x] throttled peers;
+  - [x] внутренним propagation counters/state.
+- [x] Добавить high-level command methods:
+  - [x] enqueue/cancel/update outbound message;
+  - [x] enqueue/cancel/query deferred stamp;
+  - [x] mark delivery result;
+  - [x] add/update/remove peer;
+  - [x] add/remove policy entry;
+  - [x] add/remove throttle;
+  - [x] remember/remove ticket и stamp cost.
+- [x] Добавить high-level read/query methods:
+  - [x] outbound count и bounded summary;
+  - [x] propagation count/total size;
+  - [x] point lookup propagation metadata;
+  - [x] paginated propagation metadata;
+  - [x] peer summaries/stats;
+  - [x] ticket/stamp-cost lookup;
+  - [x] router/node status snapshot.
+- [x] Не возвращать из новых методов ссылки на внутренние `HashMap`/`Vec`.
+- [x] Для списков возвращать owned DTO и использовать обязательный `limit`.
+- [x] Для больших payload отделить metadata query от payload read.
+- [x] Добавить отдельные DTO для daemon/control status вместо клонирования
   внутренних router types.
-- [ ] Перевести `lxmf-tools` на новые high-level methods.
-- [ ] Перевести control handlers на status/query DTO.
-- [ ] Перевести peer management и sync scheduling на router methods.
+- [x] Перевести `lxmf-tools` на новые high-level methods.
+- [x] Перевести control handlers на status/query DTO.
+- [x] Перевести peer management и sync scheduling на router methods.
 - [ ] Перевести сохранение tickets/stamp costs/transient IDs на storage API.
-- [ ] Перевести daemon tests на high-level API.
-- [ ] Убедиться, что production-код `lxmf-tools` больше не обращается напрямую
+- [x] Перевести daemon tests на high-level API.
+- [x] Убедиться, что production-код `lxmf-tools` больше не обращается напрямую
   к storage-sensitive полям `LxmRouter`.
-- [ ] Добавить проверку/тест, запрещающий новые прямые обращения к этим полям.
-- [ ] Сохранить старые публичные поля на переходный период для source
+- [x] Добавить проверку/тест, запрещающий новые прямые обращения к этим полям.
+- [x] Сохранить старые публичные поля на переходный период для source
   compatibility, но перестать использовать их как источник истины.
 - [ ] Пометить representation-leaking поля deprecated после перевода всех
   внутренних consumers.
-- [ ] Проверить неизменность daemon CLI и control protocol.
+- [x] Проверить неизменность daemon CLI и control protocol.
 - [ ] Выполнить regression tests `lxmf-core`, `lxmf-tools` и examples.
 
 ## 3. Storage abstraction и выбор SQLite-библиотеки
 
-- [ ] Выбрать SQLite-библиотеку (`rusqlite` как основной кандидат).
-- [ ] Решить, использовать системную SQLite или bundled feature.
+- [x] Выбрать SQLite-библиотеку (`rusqlite`).
+- [x] Использовать bundled SQLite по умолчанию; оставить отключаемый `sqlite`
+  feature для системной библиотеки.
 - [ ] Оценить размер итогового бинарника для обеих конфигураций.
-- [ ] Добавить crate feature для SQLite backend, если нужен переходный режим.
-- [ ] Ввести общий тип `StorageError`.
-- [ ] Определить trait или внутренний интерфейс `LxmfStorage`, не содержащий
+- [x] Добавить crate features `sqlite` и `sqlite-bundled`.
+- [x] Ввести общий тип `StorageError`.
+- [x] Определить trait или внутренний интерфейс `LxmfStorage`, не содержащий
   SQLite-specific types.
 - [ ] Разделить storage API по назначению:
-  - [ ] transient ID operations;
+  - [x] transient ID operations;
   - [ ] propagation metadata operations;
   - [ ] propagation payload operations;
   - [ ] outbound queue operations;
@@ -112,28 +113,29 @@
   `&HashMap` или `&[T]`.
 - [ ] Не добавлять обязательную загрузку всей таблицы в `Vec`.
 - [ ] Определить транзакционные границы между metadata, payload и transient ID.
-- [ ] Реализовать `MemoryStorage` для быстрых unit-тестов.
+- [x] Реализовать `MemoryStorage` для быстрых unit-тестов.
 - [ ] Перевести `LxmRouter` и `PropagationNode` на storage abstraction с
   `MemoryStorage`, не меняя поведение.
-- [ ] Передавать storage через constructor/builder, не через глобальный
+- [x] Передавать storage через constructor/builder, не через глобальный
   singleton.
 - [ ] Определить ownership storage между `LxmRouter`, `PropagationNode` и
   daemon, исключив дублирующие соединения и кэши.
-- [ ] Реализовать открытие и проверку SQLite database.
-- [ ] Добавить версию схемы и механизм последовательных migrations.
-- [ ] Запретить молчаливое открытие базы с более новой неизвестной схемой.
+- [x] Реализовать открытие и проверку SQLite database.
+- [x] Добавить версию схемы и механизм последовательных migrations.
+- [x] Запретить молчаливое открытие базы с более новой неизвестной схемой.
 - [ ] Определить владельца соединения:
-  - [ ] `LxmRouter`/`PropagationNode` actor;
+  - [x] `LxmRouter` actor для router-owned состояния;
   - [ ] либо отдельный storage actor.
 - [ ] Исключить выполнение длительных SQL-операций на Tokio executor thread.
 - [ ] Добавить mock/failure injection для storage errors.
 - [ ] Определить fail-open/fail-closed поведение для каждой операции.
-- [ ] Добавить contract tests, одинаковые для `MemoryStorage` и
+- [x] Добавить contract tests, одинаковые для `MemoryStorage` и
   `SqliteStorage`.
 
 ## 4. Конфигурация базы
 
-- [ ] Добавить конфигурационный путь к SQLite database.
+- [ ] Добавить конфигурируемый override пути к SQLite database (стандартный
+  путь уже добавлен).
 - [ ] Добавить конфигурируемый предел SQLite page cache.
 - [ ] Установить и протестировать:
   - [ ] `journal_mode=WAL`;
@@ -153,21 +155,21 @@
 
 ## 5. Transient ID store — первый функциональный этап
 
-- [ ] Создать таблицу `transient_ids`.
-- [ ] Закодировать типы locally delivered и locally processed.
-- [ ] Реализовать point lookup по `(kind, transient_id)`.
-- [ ] Реализовать `INSERT ... ON CONFLICT`.
-- [ ] Реализовать пакетную запись transient IDs.
-- [ ] Реализовать очистку записей старше `MESSAGE_EXPIRY * 6`.
-- [ ] Удалить загрузку обеих таблиц целиком в память при старте.
-- [ ] Перевести `is_locally_delivered`.
-- [ ] Перевести `is_locally_processed`.
-- [ ] Перевести `mark_locally_delivered`.
-- [ ] Перевести `mark_locally_processed`.
-- [ ] Удалить старое snapshot-сохранение transient ID.
-- [ ] Добавить тесты сохранения между перезапусками.
-- [ ] Добавить тесты expiry boundary.
-- [ ] Добавить тесты повторной вставки ID.
+- [x] Создать таблицу `transient_ids`.
+- [x] Закодировать типы locally delivered и locally processed.
+- [x] Реализовать point lookup по `(kind, transient_id)`.
+- [x] Реализовать `INSERT ... ON CONFLICT`.
+- [x] Реализовать пакетную запись transient IDs.
+- [x] Реализовать очистку записей по переданной expiry boundary.
+- [x] Удалить загрузку обеих таблиц целиком в память при старте.
+- [x] Перевести `is_locally_delivered`.
+- [x] Перевести `is_locally_processed`.
+- [x] Перевести `mark_locally_delivered`.
+- [x] Перевести `mark_locally_processed`.
+- [x] Удалить старое snapshot-сохранение transient ID.
+- [x] Добавить тесты сохранения между перезапусками.
+- [x] Добавить тесты expiry boundary.
+- [x] Добавить тесты повторной вставки ID.
 - [ ] Измерить RSS до и после этапа.
 
 ## 6. Propagation messages: metadata и payload
@@ -205,9 +207,8 @@
 - [ ] Удалить построение RAM-индекса из имён файлов.
 - [ ] Удалить синхронизацию metadata и файлов.
 - [ ] Удалить orphan-file cleanup.
-- [ ] Решить, нужна ли одноразовая миграция уже существующих файлов:
-  - [ ] реализовать импорт;
-  - [ ] либо документировать, что старое хранилище начинается заново.
+- [x] Одноразовую миграцию существующих файлов не реализовывать: SQLite
+  storage всегда создаётся с чистого листа.
 - [ ] После переходного периода удалить устаревшие persistence-функции.
 - [ ] Обновить конфигурацию и документацию путей хранения.
 

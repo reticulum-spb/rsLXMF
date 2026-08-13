@@ -26,7 +26,7 @@ use lxmf_core::router::{
     DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState, DirectRouteSnapshot,
     LxmRouter, OutboundAction, plan_direct_delivery,
 };
-use lxmf_tools::daemon::{DaemonConfig, create_router_with_transport, execute_on_inbound};
+use lxmf_tools::daemon::{DaemonConfig, create_router_with_sqlite, execute_on_inbound};
 use lxmf_tools::lxmd_cli::{
     Args, example_config, load_hash_list, normalize_hash_hex, parse_destination_hash,
     parse_send_fields_json,
@@ -535,7 +535,9 @@ impl LxmdRunner {
             "Crypto state loaded"
         );
 
-        let router = create_router_with_transport(&config, transport_tx.clone());
+        std::fs::create_dir_all(&paths.lxmf_storage_dir)?;
+        let router =
+            create_router_with_sqlite(&config, transport_tx.clone(), &paths.database_path)?;
 
         // LinkManager handles link handshakes (ECDH), keepalive, identification,
         // and resource transfers; it forwards plaintext application data here.
@@ -928,15 +930,8 @@ impl LxmdRunner {
                         let mut node = [0u8; 16];
                         node.copy_from_slice(&bytes);
                         client.set_propagation_node(node);
-                        runner.router.outbound_propagation_node = Some(node);
-                        runner
-                            .router
-                            .peers
-                            .entry(node)
-                            .or_insert_with(|| lxmf_core::peer::LxmPeer::new(node));
-                        if !runner.router.static_peers.contains(&node) {
-                            runner.router.static_peers.push(node);
-                        }
+                        runner.router.set_outbound_propagation_node(Some(node));
+                        runner.router.add_static_peer(node);
                         tracing::info!(
                             node = %hex::encode(node),
                             "outbound propagation node configured"
@@ -961,9 +956,7 @@ impl LxmdRunner {
     fn apply_config(&mut self) {
         if self.config.propagation_enabled {
             self.router.set_propagation_enabled(true);
-            if self.router.propagation_start_time.is_none() {
-                self.router.propagation_start_time = Some(now_f64());
-            }
+            self.router.ensure_propagation_started();
             self.router.set_autopeer(self.config.autopeer);
             self.router.set_max_peers(self.config.max_peers);
             self.router
@@ -993,13 +986,7 @@ impl LxmdRunner {
         for configured in &self.config.static_peers {
             match parse_destination_hash(configured) {
                 Ok(hash) => {
-                    if !self.router.static_peers.contains(&hash) {
-                        self.router.static_peers.push(hash);
-                    }
-                    self.router
-                        .peers
-                        .entry(hash)
-                        .or_insert_with(|| lxmf_core::peer::LxmPeer::new(hash));
+                    self.router.add_static_peer(hash);
                 }
                 Err(e) => {
                     tracing::warn!(hash = %configured, "ignoring invalid static peer hash: {e}")
@@ -1018,13 +1005,20 @@ impl LxmdRunner {
 
     fn refresh_control_state(&mut self) {
         let mut allowed_control = vec![self.identity.hash];
-        for hash in &self.router.allowed_control {
-            if !allowed_control.contains(hash) {
-                allowed_control.push(*hash);
+        for hash in self
+            .router
+            .control_allowed_identities(self.router.control_allowed_count())
+        {
+            if !allowed_control.contains(&hash) {
+                allowed_control.push(hash);
             }
         }
 
-        let peer_hashes = self.router.peers.keys().copied().collect::<HashSet<_>>();
+        let peer_hashes = self
+            .router
+            .peer_hashes(self.router.stats().peers)
+            .into_iter()
+            .collect::<HashSet<_>>();
         let stats_response = if self.config.propagation_enabled {
             let node_guard = self
                 .propagation_node
@@ -1117,7 +1111,10 @@ impl LxmdRunner {
             return false;
         }
         let mut allowed = HashSet::from([self.identity.hash]);
-        allowed.extend(self.router.allowed_control.iter().copied());
+        allowed.extend(
+            self.router
+                .control_allowed_identities(self.router.control_allowed_count()),
+        );
         allowed.len() > 1
     }
 
@@ -1125,16 +1122,13 @@ impl LxmdRunner {
         while let Ok(command) = self.control_command_rx.try_recv() {
             match command {
                 ControlCommand::Sync(peer_hash) => {
-                    if !self.router.peers.contains_key(&peer_hash) {
+                    if !self.router.has_peer(&peer_hash) {
                         continue;
                     }
                     if let Some(ref mut sync) = self.propagation_sync {
                         sync.request_sync_now(peer_hash);
                     }
-                    if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
-                        peer.next_sync_attempt = 0.0;
-                        peer.alive = true;
-                    }
+                    self.router.request_peer_sync(&peer_hash);
                     tracing::info!(peer = %hex::encode(peer_hash), "control: queued peer sync");
                 }
                 ControlCommand::Unpeer(peer_hash) => {
@@ -1490,7 +1484,7 @@ impl LxmdRunner {
                         self.last_propagation_check = now;
                         tracing::debug!("auto-triggered propagation download");
                     }
-                } else if let Some(node) = self.router.outbound_propagation_node
+                } else if let Some(node) = self.router.outbound_propagation_node()
                     && queue_unknown_propagation_node_path_request(
                         &self.transport_tx,
                         node,
@@ -2818,7 +2812,7 @@ pub(crate) async fn main() {
             "Loaded {} ignored destination(s) from ignored",
             ignored.len()
         );
-        runner.router.ignored.extend(ignored);
+        runner.router.extend_ignored(ignored);
     }
     let allowed = load_hash_list(&config_dir.join("allowed"));
     if !allowed.is_empty() {
@@ -2826,7 +2820,7 @@ pub(crate) async fn main() {
             "Loaded {} allowed destination(s) from allowed",
             allowed.len()
         );
-        runner.router.allowed.extend(allowed);
+        runner.router.extend_allowed(allowed);
     }
 
     runner.refresh_control_state();
@@ -3228,8 +3222,8 @@ mod tests {
 
         requeue_after_path_request(&mut router, &tx, message, dest, "test path wait", true);
 
-        assert_eq!(router.pending_outbound.len(), 1);
-        let queued = &router.pending_outbound[0];
+        assert_eq!(router.stats().pending_outbound, 1);
+        let queued = router.outbound_summaries(1).remove(0);
         assert_eq!(queued.delivery_attempts, 1);
         assert!(queued.last_delivery_attempt >= before);
         assert!(
@@ -3315,9 +3309,10 @@ mod tests {
 
         requeue_after_path_request(&mut router, &tx, message, dest, "transport full", false);
 
-        assert_eq!(router.pending_outbound.len(), 1);
-        assert_eq!(router.pending_outbound[0].delivery_attempts, 3);
-        assert!(router.pending_outbound[0].next_delivery_attempt > now_f64());
+        assert_eq!(router.stats().pending_outbound, 1);
+        let queued = router.outbound_summaries(1).remove(0);
+        assert_eq!(queued.delivery_attempts, 3);
+        assert!(queued.next_delivery_attempt > now_f64());
     }
 
     #[test]

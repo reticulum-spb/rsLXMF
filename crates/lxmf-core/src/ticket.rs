@@ -66,6 +66,13 @@ impl TicketStore {
         self.tickets.iter().filter(|t| t.is_valid(now)).count()
     }
 
+    pub fn remove_destination(&mut self, destination_hash: &[u8; 16]) -> usize {
+        let before = self.tickets.len();
+        self.tickets
+            .retain(|ticket| &ticket.destination_hash != destination_hash);
+        before - self.tickets.len()
+    }
+
     /// Snapshot of all stored tickets (including expired / used).
     pub fn all(&self) -> &[Ticket] {
         &self.tickets

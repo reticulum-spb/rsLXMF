@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["sqlite-bundled"]
+sqlite = ["dep:rusqlite"]
+sqlite-bundled = ["sqlite", "rusqlite/bundled"]
+
 [dependencies]
 base64 = { workspace = true }
 rns-crypto = { workspace = true }
@@ -23,6 +28,7 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

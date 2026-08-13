@@ -12,9 +12,11 @@ use tokio::sync::{mpsc, oneshot};
 use crate::constants::*;
 use crate::message::{LxMessage, MessageError};
 use crate::peer::LxmPeer;
-use crate::propagation::PropagationStore;
+use crate::propagation::{PropagationEntry, PropagationStore};
 use crate::stamper;
+use crate::storage::{LxmfStorage, MemoryStorage, StorageError, TransientIdKind};
 use crate::ticket::{Ticket, TicketStore};
+use crate::types::PropagationTransientId;
 
 /// Router configuration.
 ///
@@ -255,6 +257,7 @@ pub fn plan_direct_delivery(
 
 /// LXMF router — owns all mutable state under the actor pattern.
 pub struct LxmRouter {
+    storage: Box<dyn LxmfStorage>,
     pub config: RouterConfig,
     pub pending_outbound: Vec<LxMessage>,
     /// Messages awaiting deferred stamp generation, keyed by message hash.
@@ -328,7 +331,13 @@ pub struct StampCostEntry {
 
 impl LxmRouter {
     pub fn new(config: RouterConfig) -> Self {
+        Self::with_storage_backend(config, Box::new(MemoryStorage::new()))
+    }
+
+    /// Construct a router with an actor-owned durable storage backend.
+    pub fn with_storage_backend(config: RouterConfig, storage: Box<dyn LxmfStorage>) -> Self {
         Self {
+            storage,
             config,
             pending_outbound: Vec::new(),
             pending_deferred_stamps: HashMap::new(),
@@ -359,8 +368,189 @@ impl LxmRouter {
         }
     }
 
+    pub fn is_locally_delivered(
+        &mut self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<bool, StorageError> {
+        self.storage
+            .contains_transient_id(TransientIdKind::LocallyDelivered, transient_id)
+    }
+
+    pub fn is_locally_processed(
+        &mut self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<bool, StorageError> {
+        self.storage
+            .contains_transient_id(TransientIdKind::LocallyProcessed, transient_id)
+    }
+
+    pub fn mark_locally_delivered(
+        &mut self,
+        transient_id: PropagationTransientId,
+    ) -> Result<(), StorageError> {
+        self.storage.upsert_transient_id(
+            TransientIdKind::LocallyDelivered,
+            transient_id,
+            now_f64() as i64,
+        )
+    }
+
+    pub fn mark_locally_processed(
+        &mut self,
+        transient_id: PropagationTransientId,
+    ) -> Result<(), StorageError> {
+        self.storage.upsert_transient_id(
+            TransientIdKind::LocallyProcessed,
+            transient_id,
+            now_f64() as i64,
+        )
+    }
+
+    pub fn cull_transient_ids(&mut self, now: i64) -> Result<usize, StorageError> {
+        let retention = i64::try_from(MESSAGE_EXPIRY.saturating_mul(6)).unwrap_or(i64::MAX);
+        self.storage
+            .cull_transient_ids_before(now.saturating_sub(retention))
+    }
+
     pub fn set_transport(&mut self, tx: mpsc::Sender<rns_transport::messages::TransportMessage>) {
         self.transport_tx = Some(tx);
+    }
+
+    /// Return an owned snapshot of identities allowed to use the control API.
+    pub fn control_allowed_identities(&self, limit: usize) -> Vec<[u8; 16]> {
+        self.allowed_control.iter().copied().take(limit).collect()
+    }
+
+    pub fn control_allowed_count(&self) -> usize {
+        self.allowed_control.len()
+    }
+
+    /// Return an owned snapshot of configured peers.
+    pub fn peer_hashes(&self, limit: usize) -> Vec<[u8; 16]> {
+        self.peers.keys().copied().take(limit).collect()
+    }
+
+    pub fn has_peer(&self, destination_hash: &[u8; 16]) -> bool {
+        self.peers.contains_key(destination_hash)
+    }
+
+    /// Add a peer and mark it static. Returns whether either set changed.
+    pub fn add_static_peer(&mut self, destination_hash: [u8; 16]) -> bool {
+        let peer_was_missing = !self.peers.contains_key(&destination_hash);
+        let peer = self
+            .peers
+            .entry(destination_hash)
+            .or_insert_with(|| LxmPeer::new(destination_hash));
+        peer.is_static = true;
+        let mut changed = peer_was_missing;
+        if !self.static_peers.contains(&destination_hash) {
+            self.static_peers.push(destination_hash);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Mark a known peer ready for an immediate sync attempt.
+    pub fn request_peer_sync(&mut self, destination_hash: &[u8; 16]) -> bool {
+        let Some(peer) = self.peers.get_mut(destination_hash) else {
+            return false;
+        };
+        peer.next_sync_attempt = 0.0;
+        peer.alive = true;
+        true
+    }
+
+    pub fn outbound_propagation_node(&self) -> Option<[u8; 16]> {
+        self.outbound_propagation_node
+    }
+
+    /// Return a bounded, payload-free snapshot of queued outbound messages.
+    pub fn outbound_summaries(&self, limit: usize) -> Vec<OutboundSummary> {
+        self.pending_outbound
+            .iter()
+            .take(limit)
+            .map(|message| OutboundSummary {
+                message_id: message.message_id.or(message.hash),
+                destination_hash: message.destination_hash,
+                state: message.state,
+                method: message.method,
+                delivery_attempts: message.delivery_attempts,
+                last_delivery_attempt: message.last_delivery_attempt,
+                next_delivery_attempt: message.next_delivery_attempt,
+                progress: message.progress,
+            })
+            .collect()
+    }
+
+    /// Query one deferred-stamp message without exposing the backing map.
+    pub fn deferred_stamp_summary(&self, message_id: &[u8; 32]) -> Option<OutboundSummary> {
+        self.pending_deferred_stamps
+            .get(message_id)
+            .map(|message| OutboundSummary {
+                message_id: message.message_id.or(message.hash),
+                destination_hash: message.destination_hash,
+                state: message.state,
+                method: message.method,
+                delivery_attempts: message.delivery_attempts,
+                last_delivery_attempt: message.last_delivery_attempt,
+                next_delivery_attempt: message.next_delivery_attempt,
+                progress: message.progress,
+            })
+    }
+
+    /// Look up propagation metadata without reading a message payload.
+    pub fn propagation_metadata(
+        &self,
+        transient_id: &PropagationTransientId,
+    ) -> Option<PropagationEntry> {
+        self.propagation_store.get(transient_id).cloned()
+    }
+
+    /// Return a deterministic, bounded page of propagation metadata.
+    ///
+    /// `after` is an exclusive transient-ID cursor from the previous page.
+    pub fn propagation_metadata_page(
+        &self,
+        after: Option<&PropagationTransientId>,
+        limit: usize,
+    ) -> Vec<PropagationEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut entries = self
+            .propagation_store
+            .entries()
+            .filter(|entry| after.is_none_or(|cursor| entry.transient_id > *cursor))
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|entry| entry.transient_id);
+        entries.truncate(limit);
+        entries
+    }
+
+    /// Start propagation runtime accounting if it has not already started.
+    pub fn ensure_propagation_started(&mut self) {
+        if self.propagation_start_time.is_none() {
+            self.propagation_start_time = Some(now_f64());
+        }
+    }
+
+    pub fn extend_allowed<I>(&mut self, identities: I)
+    where
+        I: IntoIterator<Item = [u8; 16]>,
+    {
+        for identity in identities {
+            self.allow(identity);
+        }
+    }
+
+    pub fn extend_ignored<I>(&mut self, destinations: I)
+    where
+        I: IntoIterator<Item = [u8; 16]>,
+    {
+        for destination in destinations {
+            self.ignore_destination(destination);
+        }
     }
 
     pub fn has_transport(&self) -> bool {
@@ -694,6 +884,10 @@ impl LxmRouter {
             .add(Ticket::new(token, destination_hash, expires));
     }
 
+    pub fn remove_tickets(&mut self, destination_hash: &[u8; 16]) -> usize {
+        self.ticket_store.remove_destination(destination_hash)
+    }
+
     /// Returns the token of the first valid ticket for `destination_hash`.
     ///
     /// Python reference: `LXMRouter.get_outbound_ticket` — LXMRouter.py:1058-1064.
@@ -899,19 +1093,13 @@ impl LxmRouter {
         true
     }
 
-    /// Load persisted runtime state (stamp costs, tickets, dedup sets) from
-    /// `state_dir`. Missing files are treated as empty state. Dedup-cache
-    /// timestamps are restored as persisted so age-based expiry survives
-    /// restarts.
+    /// Load legacy persisted stamp costs and tickets from `state_dir`.
+    /// Transient IDs are exclusively owned by [`LxmfStorage`].
     pub fn load_state(&mut self, state_dir: &std::path::Path) -> std::io::Result<()> {
         use crate::persist;
         self.outbound_stamp_costs = persist::load_stamp_costs(state_dir)?;
         self.ticket_store
             .replace_all(persist::load_tickets(state_dir)?);
-        self.propagation_store
-            .replace_locally_delivered(persist::load_local_deliveries(state_dir)?);
-        self.propagation_store
-            .replace_locally_processed(persist::load_locally_processed(state_dir)?);
         // Python cleans tickets and stamp costs at load (LXMRouter.py:258-284).
         let now = now_f64();
         self.ticket_store.cull(now);
@@ -927,8 +1115,6 @@ impl LxmRouter {
 
         persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
         persist::save_tickets(state_dir, self.ticket_store.all())?;
-        persist::save_local_deliveries(state_dir, self.propagation_store.locally_delivered_ids())?;
-        persist::save_locally_processed(state_dir, self.propagation_store.locally_processed_ids())?;
         Ok(())
     }
 
@@ -1040,6 +1226,10 @@ impl LxmRouter {
                 recorded_at: now,
             },
         );
+    }
+
+    pub fn remove_stamp_cost(&mut self, destination_hash: &[u8; 16]) -> bool {
+        self.outbound_stamp_costs.remove(destination_hash).is_some()
     }
 
     pub fn set_propagation_enabled(&mut self, enabled: bool) {
@@ -1218,6 +1408,11 @@ impl LxmRouter {
     ///
     /// Python reference: LXMRouter.compile_stats.
     pub fn control_status(&self) -> Option<NodeStats> {
+        self.control_status_at(now_f64())
+    }
+
+    /// Summarise propagation-node state using an explicit clock value.
+    pub fn control_status_at(&self, now: f64) -> Option<NodeStats> {
         if !self.config.propagation_enabled {
             return None;
         }
@@ -1237,9 +1432,23 @@ impl LxmRouter {
                         state: peer.state as u8,
                         alive: peer.alive,
                         last_heard: peer.last_heard,
+                        next_sync_attempt: peer.next_sync_attempt,
+                        last_sync_attempt: peer.last_sync_attempt,
+                        sync_backoff: peer.sync_backoff,
+                        peering_timebase: peer.peering_timebase,
+                        link_establishment_rate: peer.link_establishment_rate,
                         sync_transfer_rate: peer.sync_transfer_rate,
                         transfer_limit: peer.propagation_transfer_limit,
+                        sync_limit: peer.propagation_sync_limit,
                         stamp_cost: peer.stamp_cost,
+                        stamp_cost_flexibility: peer.stamp_cost_flexibility,
+                        peering_cost: peer.peering_cost,
+                        peering_key: peer
+                            .peering_key
+                            .as_ref()
+                            .map(|(_, value)| u64::from(*value)),
+                        rx_bytes: peer.rx_bytes,
+                        tx_bytes: peer.tx_bytes,
                         offered: peer.offered,
                         outgoing: peer.outgoing,
                         incoming: peer.incoming,
@@ -1250,21 +1459,25 @@ impl LxmRouter {
             .collect();
 
         Some(NodeStats {
-            uptime: self
-                .propagation_start_time
-                .map(|t| now_f64() - t)
-                .unwrap_or(0.0),
+            uptime: self.propagation_start_time.map(|t| now - t).unwrap_or(0.0),
             delivery_limit: self.config.delivery_limit_kb,
             propagation_limit: self.config.propagation_limit_kb,
             sync_limit: self.config.sync_limit_kb,
             stamp_cost: self.config.propagation_stamp_cost,
             stamp_flex: self.config.propagation_stamp_flex,
             peering_cost: self.config.ext.peering_cost,
+            max_peering_cost: self.config.ext.max_peering_cost,
+            autopeer_maxdepth: self.config.ext.autopeer_maxdepth,
+            from_static_only: self.config.ext.from_static_only,
             message_count: self.propagation_store.len(),
             message_size: self.propagation_store.total_size(),
             storage_limit: self.config.ext.message_storage_limit,
             total_peers: self.peers.len(),
             max_peers: self.config.max_peers,
+            client_messages_received: self.client_propagation_messages_received,
+            client_messages_served: self.client_propagation_messages_served,
+            unpeered_incoming: self.unpeered_propagation_incoming,
+            unpeered_rx_bytes: self.unpeered_propagation_rx_bytes,
             peer_stats,
         })
     }
@@ -1286,6 +1499,10 @@ impl LxmRouter {
     pub fn throttle_peer(&mut self, peer_hash: [u8; 16]) {
         self.throttled_peers
             .insert(peer_hash, now_f64() + PN_STAMP_THROTTLE as f64);
+    }
+
+    pub fn unthrottle_peer(&mut self, peer_hash: &[u8; 16]) -> bool {
+        self.throttled_peers.remove(peer_hash).is_some()
     }
 
     /// Drop idle, non-static peers with the lowest acceptance rates.
@@ -1754,7 +1971,9 @@ impl LxmRouter {
     fn run_periodic_jobs(&mut self) {
         // Job cadences match the Python LXMRouter jobloop.
         if self.processing_count.is_multiple_of(JOB_TRANSIENT_INTERVAL) {
-            self.propagation_store.clean_transient_caches(now_f64());
+            if let Err(error) = self.cull_transient_ids(now_f64() as i64) {
+                tracing::warn!(%error, "failed to cull transient IDs");
+            }
         }
         if self.processing_count.is_multiple_of(JOB_STORE_INTERVAL)
             && self.config.propagation_enabled
@@ -1824,6 +2043,19 @@ pub struct RouterStats {
     pub stamp_costs_cached: usize,
 }
 
+/// Payload-free status for a queued outbound message.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundSummary {
+    pub message_id: Option<[u8; 32]>,
+    pub destination_hash: [u8; 16],
+    pub state: MessageState,
+    pub method: DeliveryMethod,
+    pub delivery_attempts: u32,
+    pub last_delivery_attempt: f64,
+    pub next_delivery_attempt: f64,
+    pub progress: f64,
+}
+
 /// Per-peer stats for control status.
 #[derive(Debug, Clone)]
 pub struct PeerStats {
@@ -1831,9 +2063,20 @@ pub struct PeerStats {
     pub state: u8,
     pub alive: bool,
     pub last_heard: f64,
+    pub next_sync_attempt: f64,
+    pub last_sync_attempt: f64,
+    pub sync_backoff: f64,
+    pub peering_timebase: f64,
+    pub link_establishment_rate: f64,
     pub sync_transfer_rate: f64,
     pub transfer_limit: Option<f64>,
+    pub sync_limit: Option<f64>,
     pub stamp_cost: Option<u8>,
+    pub stamp_cost_flexibility: Option<u8>,
+    pub peering_cost: u8,
+    pub peering_key: Option<u64>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
     pub offered: u64,
     pub outgoing: u64,
     pub incoming: u64,
@@ -1850,11 +2093,18 @@ pub struct NodeStats {
     pub stamp_cost: u8,
     pub stamp_flex: u8,
     pub peering_cost: u8,
+    pub max_peering_cost: u8,
+    pub autopeer_maxdepth: usize,
+    pub from_static_only: bool,
     pub message_count: usize,
     pub message_size: usize,
     pub storage_limit: Option<usize>,
     pub total_peers: usize,
     pub max_peers: usize,
+    pub client_messages_received: u64,
+    pub client_messages_served: u64,
+    pub unpeered_incoming: u64,
+    pub unpeered_rx_bytes: u64,
     pub peer_stats: HashMap<[u8; 16], PeerStats>,
 }
 
@@ -1883,6 +2133,97 @@ mod tests {
     }
 
     #[test]
+    fn high_level_snapshots_are_owned_and_bounded() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.allow_control([0x11; 16]);
+        router.add_static_peer([0x22; 16]);
+        router.send(direct_policy_message());
+
+        let mut allowed = router.control_allowed_identities(10);
+        let mut peers = router.peer_hashes(10);
+        let outbound = router.outbound_summaries(1);
+
+        allowed.clear();
+        peers.clear();
+        assert!(router.is_control_allowed(&[0x11; 16]));
+        assert!(router.has_peer(&[0x22; 16]));
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].destination_hash, [0xAA; 16]);
+        assert!(router.outbound_summaries(0).is_empty());
+    }
+
+    #[test]
+    fn peer_sync_is_updated_through_router_command() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let peer_hash = [0x33; 16];
+        assert!(!router.request_peer_sync(&peer_hash));
+        router.add_static_peer(peer_hash);
+        assert!(router.request_peer_sync(&peer_hash));
+    }
+
+    #[test]
+    fn propagation_metadata_queries_are_owned_and_paginated() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        for byte in [3_u8, 1, 2] {
+            router.propagation_store.insert(PropagationEntry::new(
+                [byte; 32],
+                [byte + 10; 32],
+                [byte + 20; 16],
+                byte as usize,
+                byte,
+            ));
+        }
+
+        let first = router.propagation_metadata_page(None, 2);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].transient_id, [1; 32]);
+        assert_eq!(first[1].transient_id, [2; 32]);
+
+        let second = router.propagation_metadata_page(Some(&first[1].transient_id), 2);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].transient_id, [3; 32]);
+        assert_eq!(
+            router.propagation_metadata(&[3; 32]).unwrap().stamp_value,
+            3
+        );
+        assert!(router.propagation_metadata_page(None, 0).is_empty());
+    }
+
+    #[test]
+    fn transient_ids_use_injected_memory_storage() {
+        let mut router = LxmRouter::with_storage_backend(
+            RouterConfig::default(),
+            Box::new(MemoryStorage::new()),
+        );
+        let transient_id = [0x55; 32];
+        assert!(!router.is_locally_delivered(&transient_id).unwrap());
+        router.mark_locally_delivered(transient_id).unwrap();
+        router.mark_locally_processed(transient_id).unwrap();
+        assert!(router.is_locally_delivered(&transient_id).unwrap());
+        assert!(router.is_locally_processed(&transient_id).unwrap());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn transient_ids_survive_router_restart_with_sqlite() {
+        use crate::storage::SqliteStorage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("router.sqlite");
+        let transient_id = [0x66; 32];
+        {
+            let storage = SqliteStorage::open(&path).unwrap();
+            let mut router =
+                LxmRouter::with_storage_backend(RouterConfig::default(), Box::new(storage));
+            router.mark_locally_delivered(transient_id).unwrap();
+        }
+        let storage = SqliteStorage::open(&path).unwrap();
+        let mut restarted =
+            LxmRouter::with_storage_backend(RouterConfig::default(), Box::new(storage));
+        assert!(restarted.is_locally_delivered(&transient_id).unwrap());
+    }
+
+    #[test]
     fn run_jobs_tick_gates_on_processing_interval() {
         let mut router = LxmRouter::new(RouterConfig::default());
         router.run_jobs_tick();
@@ -1899,26 +2240,19 @@ mod tests {
 
     #[test]
     fn run_jobs_tick_cleans_transient_caches_at_job_interval() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let ancient = 1.0; // far older than MESSAGE_EXPIRY * 6
-        let mut delivered = std::collections::HashMap::new();
-        delivered.insert([0xAB; 32], ancient);
-        router
-            .propagation_store
-            .replace_locally_delivered(delivered);
+        let mut storage = MemoryStorage::new();
+        storage
+            .upsert_transient_id(TransientIdKind::LocallyDelivered, [0xAB; 32], 1)
+            .unwrap();
+        let mut router =
+            LxmRouter::with_storage_backend(RouterConfig::default(), Box::new(storage));
 
         // Land exactly on the transient-cache job multiple.
         router.processing_count = JOB_TRANSIENT_INTERVAL - 1;
         router.last_jobs_tick = now_f64() - PROCESSING_INTERVAL as f64;
         router.run_jobs_tick();
 
-        assert!(
-            !router
-                .propagation_store
-                .locally_delivered_ids()
-                .contains_key(&[0xAB; 32]),
-            "expired dedup id must be aged out by the jobloop"
-        );
+        assert!(!router.is_locally_delivered(&[0xAB; 32]).unwrap());
     }
 
     #[test]
@@ -2527,14 +2861,10 @@ mod tests {
     fn test_save_and_load_state_roundtrip() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dest_a = [0xAA; 16];
-        let transient_a = [0x11; 32];
-
         let mut r1 = LxmRouter::new(RouterConfig::default());
         r1.set_stamp_cost(dest_a, 8);
         // Far-future expiry so get_outbound_ticket (which uses wall-clock now) matches.
         r1.remember_ticket(dest_a, [0x01; 16], 4_102_444_800.0);
-        r1.propagation_store.mark_locally_delivered(transient_a);
-        r1.propagation_store.mark_locally_processed(transient_a);
         r1.save_state(tmp.path()).unwrap();
 
         let mut r2 = LxmRouter::new(RouterConfig::default());
@@ -2544,52 +2874,6 @@ mod tests {
             Some(8)
         );
         assert_eq!(r2.get_outbound_ticket(&dest_a), Some([0x01; 16]));
-        assert!(r2.propagation_store.is_locally_delivered(&transient_a));
-        assert!(r2.propagation_store.is_locally_processed(&transient_a));
-    }
-
-    /// T1-10: persisted dedup timestamps are the REAL first-seen times —
-    /// restored on load (not reset to save-time), so age-based expiry is
-    /// stable across arbitrarily many save/load cycles.
-    #[test]
-    fn test_dedup_cache_timestamps_survive_save_load_cycles() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let transient = [0x42; 32];
-
-        let mut router = LxmRouter::new(RouterConfig::default());
-        router.propagation_store.mark_locally_delivered(transient);
-        let original_ts = *router
-            .propagation_store
-            .locally_delivered_ids()
-            .get(&transient)
-            .unwrap();
-
-        // Multiple save/load cycles must not refresh the timestamp.
-        for _ in 0..3 {
-            router.save_state(tmp.path()).unwrap();
-            let mut reloaded = LxmRouter::new(RouterConfig::default());
-            reloaded.load_state(tmp.path()).unwrap();
-            let loaded_ts = *reloaded
-                .propagation_store
-                .locally_delivered_ids()
-                .get(&transient)
-                .unwrap();
-            assert_eq!(loaded_ts, original_ts, "timestamp must survive reload");
-            router = reloaded;
-        }
-        assert_eq!(router.propagation_store.locally_delivered_ids().len(), 1);
-
-        // An aged-out entry is gone after the periodic clean, and stays gone
-        // through persistence (growth bounded).
-        let expiry = crate::constants::MESSAGE_EXPIRY as f64 * 6.0;
-        router
-            .propagation_store
-            .clean_transient_caches(original_ts + expiry + 1.0);
-        assert!(!router.propagation_store.is_locally_delivered(&transient));
-        router.save_state(tmp.path()).unwrap();
-        let mut fresh = LxmRouter::new(RouterConfig::default());
-        fresh.load_state(tmp.path()).unwrap();
-        assert!(fresh.propagation_store.locally_delivered_ids().is_empty());
     }
 
     #[test]

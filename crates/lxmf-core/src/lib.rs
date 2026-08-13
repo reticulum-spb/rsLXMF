@@ -56,6 +56,7 @@ pub mod propagation_node;
 pub mod propagation_sync;
 pub mod router;
 pub mod stamper;
+pub mod storage;
 pub mod sync;
 pub mod ticket;
 pub mod types;

@@ -4,6 +4,7 @@
 
 use lxmf_core::constants::*;
 use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
+use lxmf_core::storage::{SqliteStorage, StorageError};
 use rns_runtime::config::{Config, ConfigSection};
 
 /// Normalized view of Python `lxmd.apply_config()` behavior.
@@ -353,6 +354,17 @@ pub fn create_router_with_transport(
     router
 }
 
+pub fn create_router_with_sqlite(
+    config: &DaemonConfig,
+    transport_tx: tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>,
+    database_path: &std::path::Path,
+) -> Result<LxmRouter, StorageError> {
+    let storage = SqliteStorage::open(database_path)?;
+    let mut router = LxmRouter::with_storage_backend(config.to_router_config(), Box::new(storage));
+    router.set_transport(transport_tx);
+    Ok(router)
+}
+
 /// Execute an on_inbound hook.
 ///
 /// Runs `Command::new(prog).arg(...)` with `message_path` as a separate
@@ -544,7 +556,7 @@ propagation_transfer_max_accepted_size = 12
     fn test_create_router() {
         let dc = DaemonConfig::default();
         let router = create_router(&dc);
-        assert!(router.pending_outbound.is_empty());
+        assert_eq!(router.stats().pending_outbound, 0);
     }
 
     #[test]
@@ -553,7 +565,7 @@ propagation_transfer_max_accepted_size = 12
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let router = create_router_with_transport(&dc, tx);
         assert!(router.has_transport());
-        assert!(router.pending_outbound.is_empty());
+        assert_eq!(router.stats().pending_outbound, 0);
     }
 
     #[test]
