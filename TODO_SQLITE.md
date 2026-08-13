@@ -104,29 +104,30 @@
   SQLite-specific types.
 - [ ] Разделить storage API по назначению:
   - [x] transient ID operations;
-  - [ ] propagation metadata operations;
-  - [ ] propagation payload operations;
+  - [x] propagation metadata operations;
+  - [x] propagation payload operations;
   - [ ] outbound queue operations;
   - [ ] identity/ratchet/ticket/stamp-cost operations.
 - [ ] Для каждой группы определить point, bounded-page и batch operations.
-- [ ] Не добавлять в storage trait методы, возвращающие `&T`, `&mut T`,
+- [x] Не добавлять в storage trait методы, возвращающие `&T`, `&mut T`,
   `&HashMap` или `&[T]`.
-- [ ] Не добавлять обязательную загрузку всей таблицы в `Vec`.
-- [ ] Определить транзакционные границы между metadata, payload и transient ID.
+- [x] Не добавлять обязательную загрузку всей таблицы в `Vec`.
+- [x] Хранить metadata и payload одной атомарной storage operation;
+  transient-ID batch выполняется отдельной транзакцией.
 - [x] Реализовать `MemoryStorage` для быстрых unit-тестов.
 - [ ] Перевести `LxmRouter` и `PropagationNode` на storage abstraction с
   `MemoryStorage`, не меняя поведение.
 - [x] Передавать storage через constructor/builder, не через глобальный
   singleton.
-- [ ] Определить ownership storage между `LxmRouter`, `PropagationNode` и
+- [x] Определить ownership storage между `LxmRouter`, `PropagationNode` и
   daemon, исключив дублирующие соединения и кэши.
 - [x] Реализовать открытие и проверку SQLite database.
 - [x] Добавить версию схемы и механизм последовательных migrations.
 - [x] Запретить молчаливое открытие базы с более новой неизвестной схемой.
-- [ ] Определить владельца соединения:
-  - [x] `LxmRouter` actor для router-owned состояния;
-  - [ ] либо отдельный storage actor.
-- [ ] Исключить выполнение длительных SQL-операций на Tokio executor thread.
+- [x] Определить владельца соединения:
+  - [ ] `LxmRouter`/`PropagationNode` actor;
+  - [x] отдельный blocking storage worker с клонируемым handle.
+- [x] Исключить выполнение SQL-операций на Tokio executor thread.
 - [ ] Добавить mock/failure injection для storage errors.
 - [ ] Определить fail-open/fail-closed поведение для каждой операции.
 - [x] Добавить contract tests, одинаковые для `MemoryStorage` и
@@ -137,16 +138,16 @@
 - [ ] Добавить конфигурируемый override пути к SQLite database (стандартный
   путь уже добавлен).
 - [ ] Добавить конфигурируемый предел SQLite page cache.
-- [ ] Установить и протестировать:
-  - [ ] `journal_mode=WAL`;
-  - [ ] `synchronous=NORMAL`;
-  - [ ] `temp_store=FILE`;
-  - [ ] `cache_size`;
-  - [ ] `mmap_size=0`;
-  - [ ] `wal_autocheckpoint`;
-  - [ ] `busy_timeout`;
-  - [ ] `auto_vacuum=INCREMENTAL`.
-- [ ] Проверять фактически применённый journal mode.
+- [x] Установить и протестировать:
+  - [x] `journal_mode=WAL`;
+  - [x] `synchronous=NORMAL`;
+  - [x] `temp_store=FILE`;
+  - [x] `cache_size`;
+  - [x] `mmap_size=0`;
+  - [x] `wal_autocheckpoint`;
+  - [x] `busy_timeout`;
+  - [x] `auto_vacuum=INCREMENTAL`.
+- [x] Проверять фактически применённый journal mode.
 - [ ] Установить безопасные filesystem permissions для файла базы, WAL и SHM.
 - [ ] Определить поведение при read-only filesystem.
 - [ ] Определить поведение при отсутствии места на диске.
@@ -174,20 +175,20 @@
 
 ## 6. Propagation messages: metadata и payload
 
-- [ ] Создать таблицу `messages`.
-- [ ] Хранить metadata и payload одной атомарной записью.
-- [ ] Проверять длины transient ID, message hash и destination hash.
-- [ ] Реализовать вставку сообщения.
-- [ ] Реализовать point lookup без чтения payload.
-- [ ] Реализовать отдельную загрузку payload.
-- [ ] Реализовать проверку существования сообщения.
-- [ ] Реализовать выборку IDs.
-- [ ] Реализовать выборку сообщений по destination.
-- [ ] Реализовать удаление сообщения.
-- [ ] Реализовать обновление `collected`.
-- [ ] Реализовать получение `stamp_value`.
-- [ ] Реализовать `COUNT(*)` и `SUM(payload_size)`.
-- [ ] Реализовать expiry culling без загрузки payload.
+- [x] Создать таблицу `messages`.
+- [x] Хранить metadata и payload одной атомарной записью.
+- [x] Проверять длины transient ID, message hash и destination hash.
+- [x] Реализовать вставку сообщения.
+- [x] Реализовать point lookup без чтения payload.
+- [x] Реализовать отдельную загрузку payload.
+- [x] Реализовать проверку существования сообщения.
+- [x] Реализовать bounded выборку IDs/metadata.
+- [x] Реализовать выборку сообщений по destination.
+- [x] Реализовать удаление сообщения.
+- [x] Реализовать обновление `collected`.
+- [x] Реализовать получение `stamp_value` через metadata.
+- [x] Реализовать `COUNT(*)` и `SUM(payload_size)`.
+- [x] Реализовать expiry culling пакетами без загрузки payload.
 - [ ] Реализовать weighted culling пакетами.
 - [ ] Учесть prioritised destinations при weighted culling.
 - [ ] Сделать удаление выбранных кандидатов одной транзакцией.

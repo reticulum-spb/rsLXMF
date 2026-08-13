@@ -12,9 +12,11 @@ use tokio::sync::{mpsc, oneshot};
 use crate::constants::*;
 use crate::message::{LxMessage, MessageError};
 use crate::peer::LxmPeer;
-use crate::propagation::{PropagationEntry, PropagationStore};
+use crate::propagation::PropagationStore;
 use crate::stamper;
-use crate::storage::{LxmfStorage, MemoryStorage, StorageError, TransientIdKind};
+use crate::storage::{
+    LxmfStorage, MemoryStorage, StorageError, StoredMessageMetadata, TransientIdKind,
+};
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
 
@@ -502,8 +504,8 @@ impl LxmRouter {
     pub fn propagation_metadata(
         &self,
         transient_id: &PropagationTransientId,
-    ) -> Option<PropagationEntry> {
-        self.propagation_store.get(transient_id).cloned()
+    ) -> Result<Option<StoredMessageMetadata>, StorageError> {
+        self.storage.message_metadata(transient_id)
     }
 
     /// Return a deterministic, bounded page of propagation metadata.
@@ -513,19 +515,8 @@ impl LxmRouter {
         &self,
         after: Option<&PropagationTransientId>,
         limit: usize,
-    ) -> Vec<PropagationEntry> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        let mut entries = self
-            .propagation_store
-            .entries()
-            .filter(|entry| after.is_none_or(|cursor| entry.transient_id > *cursor))
-            .cloned()
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|entry| entry.transient_id);
-        entries.truncate(limit);
-        entries
+    ) -> Result<Vec<StoredMessageMetadata>, StorageError> {
+        self.storage.message_metadata_page(after, limit)
     }
 
     /// Start propagation runtime accounting if it has not already started.
@@ -2163,30 +2154,46 @@ mod tests {
 
     #[test]
     fn propagation_metadata_queries_are_owned_and_paginated() {
-        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut storage = MemoryStorage::new();
         for byte in [3_u8, 1, 2] {
-            router.propagation_store.insert(PropagationEntry::new(
-                [byte; 32],
-                [byte + 10; 32],
-                [byte + 20; 16],
-                byte as usize,
-                byte,
-            ));
+            storage
+                .insert_message(&crate::storage::StoredMessage::new(
+                    [byte; 32],
+                    [byte + 10; 32],
+                    [byte + 20; 16],
+                    i64::from(byte),
+                    u16::from(byte),
+                    vec![byte],
+                    false,
+                ))
+                .unwrap();
         }
+        let router = LxmRouter::with_storage_backend(RouterConfig::default(), Box::new(storage));
 
-        let first = router.propagation_metadata_page(None, 2);
+        let first = router.propagation_metadata_page(None, 2).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].transient_id, [1; 32]);
         assert_eq!(first[1].transient_id, [2; 32]);
 
-        let second = router.propagation_metadata_page(Some(&first[1].transient_id), 2);
+        let second = router
+            .propagation_metadata_page(Some(&first[1].transient_id), 2)
+            .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].transient_id, [3; 32]);
         assert_eq!(
-            router.propagation_metadata(&[3; 32]).unwrap().stamp_value,
+            router
+                .propagation_metadata(&[3; 32])
+                .unwrap()
+                .unwrap()
+                .stamp_value,
             3
         );
-        assert!(router.propagation_metadata_page(None, 0).is_empty());
+        assert!(
+            router
+                .propagation_metadata_page(None, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

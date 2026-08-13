@@ -12,6 +12,7 @@ use crate::constants::*;
 use crate::message::LxMessage;
 use crate::peer::LxmPeer;
 use crate::propagation::{PropagationEntry, PropagationStore, hex_encode};
+use crate::storage::{LxmfStorage, MemoryStorage, StoredMessage};
 use crate::sync::{OfferResponse, SyncGet, SyncOffer, SyncSession};
 use crate::types::PropagationTransientId;
 
@@ -146,6 +147,7 @@ pub fn read_planned_messages(
 pub struct PropagationNode {
     config: PropagationNodeConfig,
     store: PropagationStore,
+    storage: Box<dyn LxmfStorage>,
     sync_sessions: HashMap<[u8; 16], SyncSession>,
     pub dest_hash: [u8; 16],
     storage_path: Option<PathBuf>,
@@ -159,6 +161,23 @@ impl PropagationNode {
         Self {
             config,
             store: PropagationStore::new(),
+            storage: Box::new(MemoryStorage::new()),
+            sync_sessions: HashMap::new(),
+            dest_hash,
+            storage_path: None,
+            last_offer_times: HashMap::new(),
+        }
+    }
+
+    pub fn with_storage_backend(
+        config: PropagationNodeConfig,
+        dest_hash: [u8; 16],
+        storage: Box<dyn LxmfStorage>,
+    ) -> Self {
+        Self {
+            config,
+            store: PropagationStore::new(),
+            storage,
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: None,
@@ -184,6 +203,7 @@ impl PropagationNode {
         let mut node = Self {
             config,
             store: PropagationStore::new(),
+            storage: Box::new(MemoryStorage::new()),
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: Some(storage_path),
@@ -253,6 +273,19 @@ impl PropagationNode {
             PropagationEntry::new(transient_id, hash, message.destination_hash, msg_size, sv);
         entry.stored_at = message.timestamp;
 
+        let stored = StoredMessage::new(
+            transient_id,
+            hash,
+            message.destination_hash,
+            message.timestamp as i64,
+            u16::from(sv),
+            packed.clone(),
+            false,
+        );
+        if !matches!(self.storage.insert_message(&stored), Ok(true)) {
+            return false;
+        }
+
         if let Some(ref dir) = self.storage_path {
             let path = dir.join(entry.filename());
             if let Err(e) = std::fs::write(&path, &packed) {
@@ -300,6 +333,19 @@ impl PropagationNode {
             lxmf_data.len(),
             stamp_value,
         );
+
+        let stored = StoredMessage::new(
+            transient_id,
+            transient_id,
+            destination_hash,
+            crate::now_f64() as i64,
+            u16::from(stamp_value),
+            lxmf_data.to_vec(),
+            false,
+        );
+        if !matches!(self.storage.insert_message(&stored), Ok(true)) {
+            return false;
+        }
 
         if let Some(ref dir) = self.storage_path {
             let path = dir.join(entry.filename());
@@ -356,6 +402,19 @@ impl PropagationNode {
             stored_data.len(),
             stamp_value,
         );
+
+        let stored = StoredMessage::new(
+            transient_id,
+            transient_id,
+            destination_hash,
+            crate::now_f64() as i64,
+            u16::from(stamp_value),
+            stored_data.clone(),
+            true,
+        );
+        if !matches!(self.storage.insert_message(&stored), Ok(true)) {
+            return false;
+        }
 
         if let Some(ref dir) = self.storage_path {
             let path = dir.join(entry.filename());
@@ -469,7 +528,8 @@ impl PropagationNode {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
-        let before = self.store.len();
+        let before_ids = self.store.transient_ids();
+        let before = before_ids.len();
         self.store.cull_expired(self.config.max_message_age);
         self.store.cull_by_weight(self.config.max_storage);
         self.last_offer_times
@@ -477,6 +537,14 @@ impl PropagationNode {
         self.sync_sessions
             .retain(|_, session| !session.idle_for(SYNC_SESSION_IDLE_TIMEOUT));
         let after = self.store.len();
+
+        if before > after {
+            for transient_id in before_ids {
+                if !self.store.contains(&transient_id) {
+                    let _ = self.storage.remove_message(&transient_id);
+                }
+            }
+        }
 
         if before > after
             && let Some(ref dir) = self.storage_path
@@ -869,6 +937,7 @@ impl PropagationNode {
             let path = dir.join(entry.filename());
             let _ = std::fs::remove_file(&path);
         }
+        let _ = self.storage.remove_message(tid);
     }
 
     /// Resolve requested transient IDs into store-file read plans (no I/O).

@@ -12,6 +12,7 @@ pub enum StorageError {
     Io(std::io::Error),
     Database(String),
     InvalidData(String),
+    ActorUnavailable,
     UnsupportedSchema { found: u32, supported: u32 },
 }
 
@@ -21,6 +22,7 @@ impl fmt::Display for StorageError {
             Self::Io(error) => write!(formatter, "storage I/O error: {error}"),
             Self::Database(error) => write!(formatter, "storage database error: {error}"),
             Self::InvalidData(error) => write!(formatter, "invalid storage data: {error}"),
+            Self::ActorUnavailable => formatter.write_str("storage actor unavailable"),
             Self::UnsupportedSchema { found, supported } => write!(
                 formatter,
                 "database schema version {found} is newer than supported version {supported}"
@@ -44,10 +46,60 @@ pub enum TransientIdKind {
     LocallyProcessed = 2,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMessageMetadata {
+    pub transient_id: PropagationTransientId,
+    pub message_hash: [u8; 32],
+    pub destination_hash: [u8; 16],
+    pub stored_at: i64,
+    pub stamp_value: u16,
+    pub payload_size: usize,
+    pub collected: bool,
+    pub stamped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMessage {
+    pub metadata: StoredMessageMetadata,
+    pub payload: Vec<u8>,
+}
+
+impl StoredMessage {
+    pub fn new(
+        transient_id: PropagationTransientId,
+        message_hash: [u8; 32],
+        destination_hash: [u8; 16],
+        stored_at: i64,
+        stamp_value: u16,
+        payload: Vec<u8>,
+        stamped: bool,
+    ) -> Self {
+        Self {
+            metadata: StoredMessageMetadata {
+                transient_id,
+                message_hash,
+                destination_hash,
+                stored_at,
+                stamp_value,
+                payload_size: payload.len(),
+                collected: false,
+                stamped,
+            },
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MessageStoreStats {
+    pub count: usize,
+    pub payload_size: usize,
+}
+
 /// Synchronous because the router/storage actor owns each implementation.
 pub trait LxmfStorage: Send {
     fn contains_transient_id(
-        &mut self,
+        &self,
         kind: TransientIdKind,
         transient_id: &PropagationTransientId,
     ) -> Result<bool, StorageError>;
@@ -66,12 +118,57 @@ pub trait LxmfStorage: Send {
 
     fn cull_transient_ids_before(&mut self, cutoff: i64) -> Result<usize, StorageError>;
 
-    fn transient_id_count(&mut self, kind: TransientIdKind) -> Result<usize, StorageError>;
+    fn transient_id_count(&self, kind: TransientIdKind) -> Result<usize, StorageError>;
+
+    fn insert_message(&mut self, message: &StoredMessage) -> Result<bool, StorageError>;
+
+    fn message_metadata(
+        &self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<Option<StoredMessageMetadata>, StorageError>;
+
+    fn message_payload(
+        &self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<Option<Vec<u8>>, StorageError>;
+
+    fn message_metadata_page(
+        &self,
+        after: Option<&PropagationTransientId>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessageMetadata>, StorageError>;
+
+    fn message_metadata_for_destination(
+        &self,
+        destination_hash: &[u8; 16],
+        after: Option<&PropagationTransientId>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessageMetadata>, StorageError>;
+
+    fn remove_message(
+        &mut self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<bool, StorageError>;
+
+    fn set_message_collected(
+        &mut self,
+        transient_id: &PropagationTransientId,
+        collected: bool,
+    ) -> Result<bool, StorageError>;
+
+    fn message_store_stats(&self) -> Result<MessageStoreStats, StorageError>;
+
+    fn remove_messages_stored_before(
+        &mut self,
+        cutoff: i64,
+        limit: usize,
+    ) -> Result<usize, StorageError>;
 }
 
 #[derive(Debug, Default)]
 pub struct MemoryStorage {
     transient_ids: HashMap<(TransientIdKind, PropagationTransientId), i64>,
+    messages: HashMap<PropagationTransientId, StoredMessage>,
 }
 
 impl MemoryStorage {
@@ -82,13 +179,12 @@ impl MemoryStorage {
 
 impl LxmfStorage for MemoryStorage {
     fn contains_transient_id(
-        &mut self,
+        &self,
         kind: TransientIdKind,
         transient_id: &PropagationTransientId,
     ) -> Result<bool, StorageError> {
         Ok(self.transient_ids.contains_key(&(kind, *transient_id)))
     }
-
     fn upsert_transient_id(
         &mut self,
         kind: TransientIdKind,
@@ -115,17 +211,156 @@ impl LxmfStorage for MemoryStorage {
         Ok(before - self.transient_ids.len())
     }
 
-    fn transient_id_count(&mut self, kind: TransientIdKind) -> Result<usize, StorageError> {
+    fn transient_id_count(&self, kind: TransientIdKind) -> Result<usize, StorageError> {
         Ok(self
             .transient_ids
             .keys()
             .filter(|(entry_kind, _)| *entry_kind == kind)
             .count())
     }
+
+    fn insert_message(&mut self, message: &StoredMessage) -> Result<bool, StorageError> {
+        validate_message(message)?;
+        if self.messages.contains_key(&message.metadata.transient_id) {
+            return Ok(false);
+        }
+        self.messages
+            .insert(message.metadata.transient_id, message.clone());
+        Ok(true)
+    }
+
+    fn message_metadata(
+        &self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<Option<StoredMessageMetadata>, StorageError> {
+        Ok(self
+            .messages
+            .get(transient_id)
+            .map(|message| message.metadata.clone()))
+    }
+
+    fn message_payload(
+        &self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self
+            .messages
+            .get(transient_id)
+            .map(|message| message.payload.clone()))
+    }
+
+    fn message_metadata_page(
+        &self,
+        after: Option<&PropagationTransientId>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessageMetadata>, StorageError> {
+        Ok(metadata_page(
+            self.messages.values().map(|message| &message.metadata),
+            after,
+            limit,
+        ))
+    }
+
+    fn message_metadata_for_destination(
+        &self,
+        destination_hash: &[u8; 16],
+        after: Option<&PropagationTransientId>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessageMetadata>, StorageError> {
+        Ok(metadata_page(
+            self.messages
+                .values()
+                .map(|message| &message.metadata)
+                .filter(|metadata| &metadata.destination_hash == destination_hash),
+            after,
+            limit,
+        ))
+    }
+
+    fn remove_message(
+        &mut self,
+        transient_id: &PropagationTransientId,
+    ) -> Result<bool, StorageError> {
+        Ok(self.messages.remove(transient_id).is_some())
+    }
+
+    fn set_message_collected(
+        &mut self,
+        transient_id: &PropagationTransientId,
+        collected: bool,
+    ) -> Result<bool, StorageError> {
+        let Some(message) = self.messages.get_mut(transient_id) else {
+            return Ok(false);
+        };
+        message.metadata.collected = collected;
+        Ok(true)
+    }
+
+    fn message_store_stats(&self) -> Result<MessageStoreStats, StorageError> {
+        Ok(MessageStoreStats {
+            count: self.messages.len(),
+            payload_size: self
+                .messages
+                .values()
+                .map(|message| message.metadata.payload_size)
+                .sum(),
+        })
+    }
+
+    fn remove_messages_stored_before(
+        &mut self,
+        cutoff: i64,
+        limit: usize,
+    ) -> Result<usize, StorageError> {
+        let mut candidates = self
+            .messages
+            .values()
+            .filter(|message| message.metadata.stored_at < cutoff)
+            .map(|message| (message.metadata.stored_at, message.metadata.transient_id))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.truncate(limit);
+        let count = candidates.len();
+        for (_, transient_id) in candidates {
+            self.messages.remove(&transient_id);
+        }
+        Ok(count)
+    }
 }
 
+fn validate_message(message: &StoredMessage) -> Result<(), StorageError> {
+    if message.metadata.payload_size != message.payload.len() {
+        return Err(StorageError::InvalidData(format!(
+            "payload_size {} does not match payload length {}",
+            message.metadata.payload_size,
+            message.payload.len()
+        )));
+    }
+    Ok(())
+}
+
+fn metadata_page<'a>(
+    entries: impl Iterator<Item = &'a StoredMessageMetadata>,
+    after: Option<&PropagationTransientId>,
+    limit: usize,
+) -> Vec<StoredMessageMetadata> {
+    let mut page = entries
+        .filter(|metadata| after.is_none_or(|cursor| metadata.transient_id > *cursor))
+        .cloned()
+        .collect::<Vec<_>>();
+    page.sort_unstable_by_key(|metadata| metadata.transient_id);
+    page.truncate(limit);
+    page
+}
+
+mod actor;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+
+pub use actor::{StorageHandle, spawn_storage_actor};
+
+#[cfg(feature = "sqlite")]
+pub use actor::spawn_sqlite_storage_actor;
 
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStorage;
@@ -182,9 +417,64 @@ mod tests {
         );
     }
 
+    fn message_contract(storage: &mut dyn LxmfStorage) {
+        let first = StoredMessage::new([1; 32], [11; 32], [21; 16], 100, 8, vec![1, 2], false);
+        let second = StoredMessage::new([2; 32], [12; 32], [21; 16], 200, 9, vec![3; 3], true);
+        let third = StoredMessage::new([3; 32], [13; 32], [22; 16], 300, 10, vec![4; 4], false);
+        assert!(storage.insert_message(&second).unwrap());
+        assert!(storage.insert_message(&first).unwrap());
+        assert!(storage.insert_message(&third).unwrap());
+        assert!(!storage.insert_message(&first).unwrap());
+
+        let metadata = storage.message_metadata(&[2; 32]).unwrap().unwrap();
+        assert_eq!(metadata.payload_size, 3);
+        assert!(metadata.stamped);
+        assert_eq!(storage.message_payload(&[2; 32]).unwrap(), Some(vec![3; 3]));
+
+        let page = storage.message_metadata_page(None, 2).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].transient_id, [1; 32]);
+        assert_eq!(page[1].transient_id, [2; 32]);
+        let next = storage
+            .message_metadata_page(Some(&page[1].transient_id), 2)
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].transient_id, [3; 32]);
+
+        let destination = storage
+            .message_metadata_for_destination(&[21; 16], None, 10)
+            .unwrap();
+        assert_eq!(destination.len(), 2);
+        assert!(storage.set_message_collected(&[1; 32], true).unwrap());
+        assert!(
+            storage
+                .message_metadata(&[1; 32])
+                .unwrap()
+                .unwrap()
+                .collected
+        );
+        assert!(!storage.set_message_collected(&[9; 32], true).unwrap());
+
+        assert_eq!(
+            storage.message_store_stats().unwrap(),
+            MessageStoreStats {
+                count: 3,
+                payload_size: 9
+            }
+        );
+        assert!(storage.remove_message(&[2; 32]).unwrap());
+        assert!(!storage.remove_message(&[2; 32]).unwrap());
+        assert_eq!(storage.message_store_stats().unwrap().count, 2);
+        assert_eq!(storage.remove_messages_stored_before(300, 1).unwrap(), 1);
+        assert_eq!(storage.message_store_stats().unwrap().count, 1);
+        assert_eq!(storage.remove_messages_stored_before(300, 10).unwrap(), 0);
+    }
+
     #[test]
     fn memory_storage_contract() {
-        transient_contract(&mut MemoryStorage::new());
+        let mut storage = MemoryStorage::new();
+        transient_contract(&mut storage);
+        message_contract(&mut storage);
     }
 
     #[cfg(feature = "sqlite")]
@@ -194,17 +484,19 @@ mod tests {
         let path = directory.path().join("lxmf.sqlite");
         let mut storage = SqliteStorage::open(&path).unwrap();
         transient_contract(&mut storage);
+        message_contract(&mut storage);
 
         storage
             .upsert_transient_id(TransientIdKind::LocallyDelivered, [0x44; 32], 300)
             .unwrap();
         drop(storage);
-        let mut reopened = SqliteStorage::open(&path).unwrap();
+        let reopened = SqliteStorage::open(&path).unwrap();
         assert!(
             reopened
                 .contains_transient_id(TransientIdKind::LocallyDelivered, &[0x44; 32])
                 .unwrap()
         );
-        assert_eq!(reopened.schema_version().unwrap(), 1);
+        assert_eq!(reopened.schema_version().unwrap(), 2);
+        assert_eq!(reopened.message_store_stats().unwrap().count, 1);
     }
 }

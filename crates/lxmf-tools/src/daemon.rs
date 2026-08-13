@@ -4,7 +4,7 @@
 
 use lxmf_core::constants::*;
 use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
-use lxmf_core::storage::{SqliteStorage, StorageError};
+use lxmf_core::storage::{StorageError, spawn_sqlite_storage_actor};
 use rns_runtime::config::{Config, ConfigSection};
 
 /// Normalized view of Python `lxmd.apply_config()` behavior.
@@ -359,8 +359,9 @@ pub fn create_router_with_sqlite(
     transport_tx: tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>,
     database_path: &std::path::Path,
 ) -> Result<LxmRouter, StorageError> {
-    let storage = SqliteStorage::open(database_path)?;
-    let mut router = LxmRouter::with_storage_backend(config.to_router_config(), Box::new(storage));
+    let storage = spawn_sqlite_storage_actor(database_path.to_path_buf())?;
+    let mut router =
+        LxmRouter::with_storage_backend(config.to_router_config(), Box::new(storage.clone()));
     router.set_transport(transport_tx);
     Ok(router)
 }
