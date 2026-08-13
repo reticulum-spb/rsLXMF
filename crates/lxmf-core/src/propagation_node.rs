@@ -92,6 +92,10 @@ struct PlannedRead {
 enum PlannedReadSource {
     File(PathBuf),
     Payload(Vec<u8>),
+    Storage {
+        storage: crate::storage::StorageHandle,
+        transient_id: PropagationTransientId,
+    },
 }
 
 impl GetServePlan {
@@ -100,22 +104,31 @@ impl GetServePlan {
     /// 24-byte base + 16 bytes per message, full stored size counted,
     /// over-limit entries skipped (not a transfer abort), stamps stripped
     /// for client download. Unreadable files are skipped.
-    pub fn serve(&self) -> Vec<u8> {
+    pub fn serve(self) -> Vec<u8> {
         use rmpv::Value;
 
         const PER_MESSAGE_OVERHEAD: f64 = 16.0;
         let mut cumulative_size: f64 = 24.0;
         let mut messages: Vec<Value> = Vec::new();
 
-        for read in &self.reads {
-            let data = match &read.source {
+        for read in self.reads {
+            let data = match read.source {
                 PlannedReadSource::File(path) => {
-                    let Ok(data) = std::fs::read(path) else {
+                    let Ok(data) = std::fs::read(&path) else {
                         continue;
                     };
                     data
                 }
-                PlannedReadSource::Payload(payload) => payload.clone(),
+                PlannedReadSource::Payload(payload) => payload,
+                PlannedReadSource::Storage {
+                    storage,
+                    transient_id,
+                } => {
+                    let Ok(Some(payload)) = storage.message_payload(&transient_id) else {
+                        continue;
+                    };
+                    payload
+                }
             };
             let next_size = cumulative_size + data.len() as f64 + PER_MESSAGE_OVERHEAD;
             if self.limit_bytes.is_some_and(|limit| next_size > limit) {
@@ -160,6 +173,7 @@ pub struct PropagationNode {
     config: PropagationNodeConfig,
     store: PropagationStore,
     storage: Box<dyn LxmfStorage>,
+    storage_reader: Option<crate::storage::StorageHandle>,
     storage_authoritative: bool,
     sync_sessions: HashMap<[u8; 16], SyncSession>,
     pub dest_hash: [u8; 16],
@@ -175,6 +189,7 @@ impl PropagationNode {
             config,
             store: PropagationStore::new(),
             storage: Box::new(MemoryStorage::new()),
+            storage_reader: None,
             storage_authoritative: false,
             sync_sessions: HashMap::new(),
             dest_hash,
@@ -192,6 +207,27 @@ impl PropagationNode {
             config,
             store: PropagationStore::new(),
             storage,
+            storage_reader: None,
+            storage_authoritative: true,
+            sync_sessions: HashMap::new(),
+            dest_hash,
+            storage_path: None,
+            last_offer_times: HashMap::new(),
+        }
+    }
+
+    /// Actor-backed node whose phase-2 payload reads are deferred until the
+    /// caller has released the node lock.
+    pub fn with_shared_storage_backend(
+        config: PropagationNodeConfig,
+        dest_hash: [u8; 16],
+        storage: crate::storage::StorageHandle,
+    ) -> Self {
+        Self {
+            config,
+            store: PropagationStore::new(),
+            storage: Box::new(storage.clone()),
+            storage_reader: Some(storage),
             storage_authoritative: true,
             sync_sessions: HashMap::new(),
             dest_hash,
@@ -219,6 +255,7 @@ impl PropagationNode {
             config,
             store: PropagationStore::new(),
             storage: Box::new(MemoryStorage::new()),
+            storage_reader: None,
             storage_authoritative: false,
             sync_sessions: HashMap::new(),
             dest_hash,
@@ -1023,6 +1060,17 @@ impl PropagationNode {
                                 source: PlannedReadSource::File(dir.join(entry.filename())),
                                 stamped: entry.stamped,
                             });
+                        } else if let Some(storage) = &self.storage_reader
+                            && let Ok(Some(metadata)) = self.storage.message_metadata(&tid)
+                            && metadata.destination_hash == *client_dest_hash
+                        {
+                            reads.push(PlannedRead {
+                                source: PlannedReadSource::Storage {
+                                    storage: storage.clone(),
+                                    transient_id: tid,
+                                },
+                                stamped: metadata.stamped,
+                            });
                         } else if self.storage_authoritative
                             && let Ok(Some(metadata)) = self.storage.message_metadata(&tid)
                             && metadata.destination_hash == *client_dest_hash
@@ -1365,6 +1413,32 @@ mod tests {
 
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
         assert!(!node.accept_message(&msg2));
+    }
+
+    #[test]
+    fn authoritative_storage_enforces_total_and_message_size_limits() {
+        let first = [[0x11; 16].as_slice(), &[0x01, 0x02][..]].concat();
+        let second = [[0x22; 16].as_slice(), &[0x03][..]].concat();
+        let mut node = PropagationNode::with_storage_backend(
+            PropagationNodeConfig {
+                max_storage: first.len() + second.len() - 1,
+                max_message_size: first.len(),
+                ..Default::default()
+            },
+            [0xAA; 16],
+            Box::new(MemoryStorage::new()),
+        );
+
+        assert!(node.accept_propagated_blob(&first, 0));
+        assert!(!node.accept_propagated_blob(&second, 0));
+        assert_eq!(node.message_count(), 1);
+        assert_eq!(node.total_size(), first.len());
+
+        let oversized = [[0x33; 16].as_slice(), &[0x04, 0x05, 0x06][..]].concat();
+        assert_eq!(oversized.len(), first.len() + 1);
+        assert!(!node.accept_propagated_blob(&oversized, 0));
+        assert_eq!(node.message_count(), 1);
+        assert_eq!(node.total_size(), first.len());
     }
 
     #[test]
@@ -1808,20 +1882,20 @@ mod tests {
 
         {
             let handle = spawn_sqlite_storage_actor(database.clone()).unwrap();
-            let mut node = PropagationNode::with_storage_backend(
+            let mut node = PropagationNode::with_shared_storage_backend(
                 PropagationNodeConfig::default(),
                 [0x55; 16],
-                Box::new(handle),
+                handle,
             );
             assert!(node.accept_propagated_blob(&payload, 8));
             assert_eq!(node.message_count(), 1);
         }
 
         let handle = spawn_sqlite_storage_actor(database).unwrap();
-        let node = PropagationNode::with_storage_backend(
+        let mut node = PropagationNode::with_shared_storage_backend(
             PropagationNodeConfig::default(),
             [0x55; 16],
-            Box::new(handle),
+            handle.clone(),
         );
         assert!(node.contains(&transient_id));
         assert_eq!(node.create_offer([0; 16], None), vec![transient_id]);
@@ -1829,6 +1903,24 @@ mod tests {
             node.message_get_request(&[transient_id]),
             vec![(transient_id, payload)]
         );
+
+        use rmpv::Value;
+        let get_request = crate::encode_value(&Value::Array(vec![
+            Value::Array(vec![Value::Binary(transient_id.to_vec())]),
+            Value::Array(Vec::new()),
+        ]));
+        let action = node.handle_get_request(&get_request, &destination_hash);
+        let GetRequestAction::ServeFiles(plan) = action else {
+            panic!("phase 2 must return a deferred SQLite read plan");
+        };
+
+        // Deleting after planning but before serving proves that the payload
+        // was not eagerly loaded while the node was borrowed.
+        let mut storage = handle;
+        assert!(storage.remove_message(&transient_id).unwrap());
+        let response = plan.serve();
+        let decoded: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
+        assert!(decoded.as_array().unwrap().is_empty());
     }
 
     #[test]

@@ -607,10 +607,10 @@ impl LxmdRunner {
                     .saturating_sub(config.propagation_stamp_flex),
                 ..Default::default()
             };
-            let pn = Arc::new(Mutex::new(PropagationNode::with_storage_backend(
+            let pn = Arc::new(Mutex::new(PropagationNode::with_shared_storage_backend(
                 pn_config,
                 propagation_dest_hash,
-                Box::new(storage.clone()),
+                storage.clone(),
             )));
 
             // TODO(hardware-identity): route propagation link signing through the
