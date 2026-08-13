@@ -3,7 +3,7 @@
 //! Python reference: LXMF/Utilities/lxmd.py.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -413,9 +413,6 @@ struct LxmdRunner {
     control_dest_hash: [u8; 16],
     router: LxmRouter,
     config: DaemonConfig,
-    data_dir: PathBuf,
-    messages_dir: PathBuf,
-    ratchets_dir: PathBuf,
     delivery_ratchets: DeliveryRatchetState,
     received_ratchets: HashMap<String, ReceivedRatchet>,
     known_identities: HashMap<String, [u8; 64]>,
@@ -449,11 +446,10 @@ struct LxmdRunner {
     last_peer_announce: f64,
     last_node_announce: f64,
     last_propagation_check: f64,
-    last_crypto_save: f64,
+    last_storage_checkpoint: f64,
     last_cull: f64,
     last_ratchet_clean: f64,
     last_route_refresh: f64,
-    received_ratchets_dir: PathBuf,
     control_state: Arc<Mutex<ControlSnapshot>>,
     control_command_rx: mpsc::Receiver<ControlCommand>,
 }
@@ -513,24 +509,29 @@ impl LxmdRunner {
             &hex::encode(lxmf_dest_hash)[..16],
         );
 
-        let ratchet_dir = paths.ratchets_dir.clone();
-        std::fs::create_dir_all(&ratchet_dir)?;
-        let wall_now = now_f64() as u64;
-        let delivery_ratchets = DeliveryRatchetState::load_or_initialize(
-            &identity,
-            lxmf_dest_hash,
-            paths.ratchet_ring_path.clone(),
-            paths.ratchet_control_path.clone(),
-            wall_now,
-        )?;
-
-        let received_dir = paths.received_ratchets_dir.clone();
-        let mut received_ratchets = HashMap::new();
-        let mut known_identities: HashMap<String, [u8; 64]> = HashMap::new();
-
         std::fs::create_dir_all(&paths.lxmf_storage_dir)?;
         let (mut router, storage) =
             create_router_with_sqlite(&config, transport_tx.clone(), &paths.database_path)?;
+        let persisted_peers = router.load_persisted_peers();
+        tracing::info!(persisted_peers, "Propagation peers loaded from SQLite");
+
+        let wall_now = now_f64() as u64;
+        let delivery_ratchets = DeliveryRatchetState::load_or_initialize_from_blobs(
+            &identity,
+            lxmf_dest_hash,
+            router.state_blob("delivery_ratchet_ring").as_deref(),
+            router.state_blob("delivery_ratchet_control").as_deref(),
+            wall_now,
+        )?;
+        let (ring_blob, control_blob) = delivery_ratchets.signed_blobs()?;
+        router.put_state_blobs(&[
+            ("delivery_ratchet_ring", &ring_blob),
+            ("delivery_ratchet_control", &control_blob),
+        ])?;
+
+        let mut received_ratchets = HashMap::new();
+        let mut known_identities: HashMap<String, [u8; 64]> = HashMap::new();
+
         for (hash, public_key) in router.identity_cache_seed(KNOWN_IDENTITIES_SOFT_CAP) {
             known_identities.insert(hex::encode(hash), public_key);
         }
@@ -842,9 +843,6 @@ impl LxmdRunner {
             callback_tx: announce_tx,
         });
 
-        let messages_dir = paths.messages_dir.clone();
-        std::fs::create_dir_all(&messages_dir)?;
-
         let now = now_f64();
 
         let mut runner = Self {
@@ -855,9 +853,6 @@ impl LxmdRunner {
             control_dest_hash,
             router,
             config,
-            data_dir: paths.router_state_dir,
-            messages_dir,
-            ratchets_dir: paths.ratchets_dir,
             delivery_ratchets,
             received_ratchets,
             known_identities,
@@ -884,11 +879,10 @@ impl LxmdRunner {
             last_peer_announce: 0.0,
             last_node_announce: 0.0,
             last_propagation_check: 0.0,
-            last_crypto_save: now,
+            last_storage_checkpoint: now,
             last_cull: now,
             last_ratchet_clean: now,
             last_route_refresh: 0.0,
-            received_ratchets_dir: received_dir,
             control_state,
             control_command_rx,
         };
@@ -1048,7 +1042,8 @@ impl LxmdRunner {
         let app_data =
             delivery_announce_app_data(self.config.display_name.as_deref(), self.config.stamp_cost);
         let now = now_f64();
-        self.delivery_ratchets
+        let packet = self
+            .delivery_ratchets
             .create_announce(
                 &self.identity,
                 &app_data,
@@ -1056,7 +1051,18 @@ impl LxmdRunner {
                 now,
                 DeliveryAnnounceKind::Broadcast,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let (ring_blob, control_blob) = self
+            .delivery_ratchets
+            .signed_blobs()
+            .map_err(|error| format!("failed to encode delivery ratchet state: {error}"))?;
+        self.router
+            .put_state_blobs(&[
+                ("delivery_ratchet_ring", &ring_blob),
+                ("delivery_ratchet_control", &control_blob),
+            ])
+            .map_err(|error| format!("failed to persist delivery ratchet state: {error}"))?;
+        Ok(packet)
     }
 
     fn create_propagation_announce_packet(&mut self) -> Result<Vec<u8>, String> {
@@ -1133,8 +1139,8 @@ impl LxmdRunner {
                 }
                 ControlCommand::Unpeer(peer_hash) => {
                     self.router.unpeer(&peer_hash);
-                    if let Err(e) = self.router.save_state(&self.data_dir) {
-                        tracing::warn!("Failed to save router state after control unpeer: {e}");
+                    if let Err(error) = self.router.checkpoint_peers() {
+                        tracing::warn!(%error, "failed to persist peer removal");
                     }
                     tracing::info!(peer = %hex::encode(peer_hash), "control: unpeered peer");
                 }
@@ -1562,12 +1568,11 @@ impl LxmdRunner {
             self.last_cull = now;
         }
 
-        if now - self.last_crypto_save > 300.0 {
-            self.save_crypto_state();
-            if let Err(e) = self.router.save_state(&self.data_dir) {
-                tracing::warn!("Failed to save router state: {e}");
+        if now - self.last_storage_checkpoint > 300.0 {
+            if let Err(error) = self.router.checkpoint_peers() {
+                tracing::warn!(%error, "failed to checkpoint propagation peers");
             }
-            self.last_crypto_save = now;
+            self.last_storage_checkpoint = now;
         }
 
         // 15-minute interval matches Python's CLEAN_INTERVAL.
@@ -2550,13 +2555,6 @@ impl LxmdRunner {
         proof_raw.extend_from_slice(&signature);
         Some(proof_raw)
     }
-
-    fn save_crypto_state(&self) {
-        let ratchet_dir = self.ratchets_dir.clone();
-        std::fs::create_dir_all(&ratchet_dir).ok();
-
-        self.delivery_ratchets.save(&self.identity);
-    }
 }
 
 #[tokio::main]
@@ -2795,15 +2793,6 @@ pub(crate) async fn main() {
     };
 
     runner.apply_config();
-
-    if let Err(e) = runner.router.load_state(&runner.data_dir) {
-        tracing::warn!("Failed to load persisted router state: {e}");
-    } else {
-        tracing::info!(
-            "Loaded persisted router state from {}",
-            runner.data_dir.display()
-        );
-    }
 
     let ignored = load_hash_list(&config_dir.join("ignored"));
     if !ignored.is_empty() {
@@ -3121,9 +3110,8 @@ pub(crate) async fn main() {
     }
 
     tracing::info!("LXMF Daemon shutting down");
-    runner.save_crypto_state();
-    if let Err(e) = runner.router.save_state(&runner.data_dir) {
-        tracing::warn!("Failed to save router state on shutdown: {e}");
+    if let Err(error) = runner.router.checkpoint_peers() {
+        tracing::warn!(%error, "failed to checkpoint propagation peers on shutdown");
     }
     tracing::info!("Crypto state saved");
     tracing::info!("LXMF Daemon stopped");
@@ -3400,26 +3388,22 @@ mod tests {
             .expect("unpack")
             .hash
             .expect("hash");
-        let msg_path = runner
-            .messages_dir
-            .join(format!("{}.lxm", hex::encode(hash)));
-
         runner.handle_propagation_downloaded_data(&data);
-        // Grace period: an (incorrectly) accepted message would be written on the blocking pool.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
-            !msg_path.exists(),
+            !runner.router.contains_inbound_message(&hash),
             "unstamped propagated message must be rejected"
         );
 
         runner.config.enforce_stamps = false;
         runner.handle_propagation_downloaded_data(&data);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !msg_path.exists() && std::time::Instant::now() < deadline {
+        while !runner.router.contains_inbound_message(&hash) && std::time::Instant::now() < deadline
+        {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(
-            msg_path.exists(),
+            runner.router.contains_inbound_message(&hash),
             "message must be stored once enforcement is off"
         );
         let _ = std::fs::remove_dir_all(&temp);

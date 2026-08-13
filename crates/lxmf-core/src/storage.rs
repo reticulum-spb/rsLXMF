@@ -271,6 +271,12 @@ pub trait LxmfStorage: Send {
     fn ratchet_page(&self, cutoff: f64, limit: usize) -> Result<Vec<StoredRatchet>, StorageError>;
     fn cull_ratchets_before(&mut self, cutoff: f64) -> Result<usize, StorageError>;
     fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError>;
+    fn put_state_blobs(&mut self, entries: &[(&str, &[u8])]) -> Result<(), StorageError> {
+        for (key, value) in entries {
+            self.put_state_blob(key, value)?;
+        }
+        Ok(())
+    }
     fn state_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
     fn insert_inbound_message(
         &mut self,
@@ -278,6 +284,9 @@ pub trait LxmfStorage: Send {
         received_at: f64,
         encoded: &[u8],
     ) -> Result<(), StorageError>;
+    fn contains_inbound_message(&self, message_id: &[u8; 32]) -> Result<bool, StorageError>;
+    fn replace_peers(&mut self, peers: &[([u8; 16], Vec<u8>)]) -> Result<(), StorageError>;
+    fn peer_page(&self, limit: usize) -> Result<Vec<([u8; 16], Vec<u8>)>, StorageError>;
 }
 
 #[derive(Debug, Default)]
@@ -291,6 +300,7 @@ pub struct MemoryStorage {
     ratchets: HashMap<[u8; 16], StoredRatchet>,
     state_blobs: HashMap<String, Vec<u8>>,
     inbound_messages: HashMap<[u8; 32], (f64, Vec<u8>)>,
+    peers: HashMap<[u8; 16], Vec<u8>>,
 }
 
 impl MemoryStorage {
@@ -695,6 +705,21 @@ impl LxmfStorage for MemoryStorage {
         self.inbound_messages.insert(id, (at, encoded.to_vec()));
         Ok(())
     }
+    fn contains_inbound_message(&self, message_id: &[u8; 32]) -> Result<bool, StorageError> {
+        Ok(self.inbound_messages.contains_key(message_id))
+    }
+    fn replace_peers(&mut self, peers: &[([u8; 16], Vec<u8>)]) -> Result<(), StorageError> {
+        self.peers = peers.iter().cloned().collect();
+        Ok(())
+    }
+    fn peer_page(&self, limit: usize) -> Result<Vec<([u8; 16], Vec<u8>)>, StorageError> {
+        Ok(self
+            .peers
+            .iter()
+            .take(limit)
+            .map(|(h, v)| (*h, v.clone()))
+            .collect())
+    }
 }
 
 impl StoredOutboundMetadata {
@@ -1037,7 +1062,7 @@ mod tests {
                 .contains_transient_id(TransientIdKind::LocallyDelivered, &[0x44; 32])
                 .unwrap()
         );
-        assert_eq!(reopened.schema_version().unwrap(), 6);
+        assert_eq!(reopened.schema_version().unwrap(), 7);
         assert_eq!(reopened.message_store_stats().unwrap().count, 1);
     }
 }

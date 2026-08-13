@@ -477,6 +477,9 @@ impl LxmRouter {
     pub fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
         self.storage.put_state_blob(key, value)
     }
+    pub fn put_state_blobs(&mut self, entries: &[(&str, &[u8])]) -> Result<(), StorageError> {
+        self.storage.put_state_blobs(entries)
+    }
     pub fn state_blob(&self, key: &str) -> Option<Vec<u8>> {
         self.storage.state_blob(key).ok().flatten()
     }
@@ -486,6 +489,29 @@ impl LxmRouter {
         encoded: &[u8],
     ) -> Result<(), StorageError> {
         self.storage.insert_inbound_message(id, now_f64(), encoded)
+    }
+    pub fn contains_inbound_message(&self, id: &[u8; 32]) -> bool {
+        self.storage.contains_inbound_message(id).unwrap_or(false)
+    }
+    pub fn load_persisted_peers(&mut self) -> usize {
+        let limit = self.config.max_peers;
+        let peers = self.storage.peer_page(limit).unwrap_or_default();
+        for (hash, encoded) in peers {
+            if let Some(peer) = LxmPeer::from_bytes_with_handled(&encoded)
+                && peer.destination_hash == hash
+            {
+                self.peers.insert(hash, peer);
+            }
+        }
+        self.peers.len()
+    }
+    pub fn checkpoint_peers(&mut self) -> Result<(), StorageError> {
+        let peers = self
+            .peers
+            .iter()
+            .map(|(hash, peer)| (*hash, peer.to_bytes_with_handled()))
+            .collect::<Vec<_>>();
+        self.storage.replace_peers(&peers)
     }
 
     fn persist_outbound_message(&mut self, message: &LxMessage, deferred: bool) -> bool {
@@ -1553,6 +1579,11 @@ impl LxmRouter {
             return false;
         }
         self.peers.insert(peer.destination_hash, peer);
+        if self.storage_authoritative
+            && let Err(error) = self.checkpoint_peers()
+        {
+            tracing::warn!(%error, "failed to persist added propagation peer");
+        }
         true
     }
 
@@ -1607,12 +1638,18 @@ impl LxmRouter {
 
     pub fn remove_peer(&mut self, destination_hash: &[u8; 16]) {
         self.peers.remove(destination_hash);
+        if self.storage_authoritative {
+            let _ = self.checkpoint_peers();
+        }
     }
 
     /// Remove a peer from both the active and static peer sets.
     pub fn unpeer(&mut self, destination_hash: &[u8; 16]) {
         self.peers.remove(destination_hash);
         self.static_peers.retain(|h| h != destination_hash);
+        if self.storage_authoritative {
+            let _ = self.checkpoint_peers();
+        }
     }
 
     /// Get a cached outbound stamp cost, or `None` if missing or expired.

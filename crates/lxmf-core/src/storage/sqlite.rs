@@ -9,7 +9,7 @@ use super::{
 };
 use crate::types::PropagationTransientId;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 pub struct SqliteStorage {
     connection: Connection,
@@ -643,6 +643,13 @@ impl LxmfStorage for SqliteStorage {
     fn put_state_blob(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
         self.connection.execute("INSERT INTO state_blobs(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map(|_|()).map_err(database_error)
     }
+    fn put_state_blobs(&mut self, entries: &[(&str, &[u8])]) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        for (key, value) in entries {
+            transaction.execute("INSERT INTO state_blobs(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value]).map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
+    }
     fn state_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         self.connection
             .query_row("SELECT value FROM state_blobs WHERE key=?1", [key], |r| {
@@ -658,6 +665,46 @@ impl LxmfStorage for SqliteStorage {
         encoded: &[u8],
     ) -> Result<(), StorageError> {
         self.connection.execute("INSERT OR IGNORE INTO inbound_messages(message_id,received_at,encoded_message) VALUES(?1,?2,?3)",params![id.as_slice(),at,encoded]).map(|_|()).map_err(database_error)
+    }
+    fn contains_inbound_message(&self, message_id: &[u8; 32]) -> Result<bool, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM inbound_messages WHERE message_id=?1)",
+                [message_id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+    fn replace_peers(&mut self, peers: &[([u8; 16], Vec<u8>)]) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        transaction
+            .execute("DELETE FROM peers", [])
+            .map_err(database_error)?;
+        for (hash, encoded) in peers {
+            transaction
+                .execute(
+                    "INSERT INTO peers(destination_hash,encoded_peer) VALUES(?1,?2)",
+                    params![hash.as_slice(), encoded],
+                )
+                .map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
+    }
+    fn peer_page(&self, limit: usize) -> Result<Vec<([u8; 16], Vec<u8>)>, StorageError> {
+        let mut statement = self.connection.prepare("SELECT destination_hash,encoded_peer FROM peers ORDER BY destination_hash LIMIT ?1").map_err(database_error)?;
+        let rows = statement
+            .query_map([limit as i64], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(database_error)?;
+        rows.map(|row| {
+            let (hash, encoded) = row.map_err(database_error)?;
+            let hash = hash
+                .try_into()
+                .map_err(|_| StorageError::InvalidData("invalid peer destination hash".into()))?;
+            Ok((hash, encoded))
+        })
+        .collect()
     }
 }
 
@@ -774,6 +821,11 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
     if found < 6 {
         let transaction = connection.transaction().map_err(database_error)?;
         transaction.execute_batch("CREATE TABLE state_blobs(key TEXT PRIMARY KEY,value BLOB NOT NULL) WITHOUT ROWID; CREATE TABLE inbound_messages(message_id BLOB PRIMARY KEY CHECK(length(message_id)=32),received_at REAL NOT NULL,encoded_message BLOB NOT NULL) WITHOUT ROWID; CREATE INDEX inbound_received ON inbound_messages(received_at); INSERT INTO schema_meta(key,value) VALUES('schema_version','6') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+    }
+    if found < 7 {
+        let transaction = connection.transaction().map_err(database_error)?;
+        transaction.execute_batch("CREATE TABLE peers(destination_hash BLOB PRIMARY KEY CHECK(length(destination_hash)=16),encoded_peer BLOB NOT NULL) WITHOUT ROWID; INSERT INTO schema_meta(key,value) VALUES('schema_version','7') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(database_error)?;
         transaction.commit().map_err(database_error)?;
     }
     Ok(())
@@ -944,7 +996,7 @@ mod tests {
         drop(connection);
 
         let mut storage = SqliteStorage::open(&path).unwrap();
-        assert_eq!(storage.schema_version().unwrap(), 6);
+        assert_eq!(storage.schema_version().unwrap(), 7);
         assert_eq!(storage.message_store_stats().unwrap().count, 0);
         assert!(
             storage

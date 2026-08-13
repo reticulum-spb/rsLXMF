@@ -246,8 +246,12 @@
 - [x] Гарантировать атомарную замену ratchet в SQLite через UPSERT.
 - [x] Перенести tickets.
 - [x] Перенести outbound stamp costs.
-- [x] Проверить необходимость переноса peer metadata: пока не требуется;
-  bounded числом configured/max peers и не является источником роста.
+- [x] Перенести peer metadata и handled-message sets в SQLite; восстанавливать
+  при старте и атомарно чекпоинтить bounded-набор peers.
+- [x] Перенести delivery ratchet ring и подписанный announce control state в
+  SQLite blobs; фиксировать оба документа одной транзакцией до отправки announce.
+- [x] Прекратить создание `storage/messages`, `storage/lxmf/ratchets` и вызовы
+  устаревших `load_state`/`save_state` в production `lxmd`.
 - [x] Не переносить активное состояние link/session в SQLite.
 
 ## 10. Ограничение дискового пространства и обслуживание

@@ -54,6 +54,7 @@ pub struct DeliveryRatchetState {
     control_path: PathBuf,
     ring_file_trusted: bool,
     control_file_trusted: bool,
+    temporary_backing: Option<tempfile::TempDir>,
 }
 
 impl DeliveryRatchetState {
@@ -178,7 +179,60 @@ impl DeliveryRatchetState {
             control_path,
             ring_file_trusted,
             control_file_trusted,
+            temporary_backing: None,
         })
+    }
+
+    /// Restore the signed ratchet documents from database blobs. The backing
+    /// files live only in an automatically removed temporary directory because
+    /// `rns-identity` currently exposes its verified format through path APIs.
+    pub fn load_or_initialize_from_blobs(
+        identity: &Identity,
+        destination_hash: [u8; 16],
+        ring_blob: Option<&[u8]>,
+        control_blob: Option<&[u8]>,
+        wall_now: u64,
+    ) -> Result<Self, DeliveryRatchetError> {
+        let temporary_backing =
+            tempfile::tempdir().map_err(|source| DeliveryRatchetError::PersistControl {
+                path: PathBuf::from("<temporary ratchet state>"),
+                source,
+            })?;
+        let ring_path = temporary_backing.path().join("ring");
+        let control_path = temporary_backing.path().join("control");
+        if let Some(blob) = ring_blob {
+            std::fs::write(&ring_path, blob).map_err(|source| {
+                DeliveryRatchetError::PersistControl {
+                    path: ring_path.clone(),
+                    source,
+                }
+            })?;
+        }
+        if let Some(blob) = control_blob {
+            std::fs::write(&control_path, blob).map_err(|source| {
+                DeliveryRatchetError::PersistControl {
+                    path: control_path.clone(),
+                    source,
+                }
+            })?;
+        }
+        let mut state = Self::load_or_initialize(
+            identity,
+            destination_hash,
+            ring_path,
+            control_path,
+            wall_now,
+        )?;
+        state.temporary_backing = Some(temporary_backing);
+        Ok(state)
+    }
+
+    /// Return the exact signed documents to commit atomically to durable storage.
+    pub fn signed_blobs(&self) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+        Ok((
+            std::fs::read(&self.ring_path)?,
+            std::fs::read(&self.control_path)?,
+        ))
     }
 
     pub fn destination_hash(&self) -> [u8; 16] {
@@ -344,6 +398,44 @@ mod tests {
             wall_now,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn signed_database_blobs_restore_ring_and_control_state() {
+        let identity = Identity::new();
+        let destination_hash =
+            Destination::hash_from_name_and_identity(DELIVERY_APP_NAME, Some(&identity.hash));
+        let mut state = DeliveryRatchetState::load_or_initialize_from_blobs(
+            &identity,
+            destination_hash,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        state
+            .create_announce(
+                &identity,
+                b"app",
+                101,
+                101.0,
+                DeliveryAnnounceKind::Broadcast,
+            )
+            .unwrap();
+        let keys = state.ring().private_keys().to_vec();
+        let control = state.control().clone();
+        let (ring_blob, control_blob) = state.signed_blobs().unwrap();
+
+        let restored = DeliveryRatchetState::load_or_initialize_from_blobs(
+            &identity,
+            destination_hash,
+            Some(&ring_blob),
+            Some(&control_blob),
+            102,
+        )
+        .unwrap();
+        assert_eq!(restored.ring().private_keys(), keys);
+        assert_eq!(restored.control(), &control);
     }
 
     #[test]

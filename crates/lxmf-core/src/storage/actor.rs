@@ -358,6 +358,19 @@ impl LxmfStorage for StorageHandle {
         let value = value.to_vec();
         self.call(move |s| s.put_state_blob(&key, &value))
     }
+    fn put_state_blobs(&mut self, entries: &[(&str, &[u8])]) -> Result<(), StorageError> {
+        let entries = entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_vec()))
+            .collect::<Vec<_>>();
+        self.call(move |s| {
+            let borrowed = entries
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_slice()))
+                .collect::<Vec<_>>();
+            s.put_state_blobs(&borrowed)
+        })
+    }
     fn state_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         let key = key.to_string();
         self.call(move |s| s.state_blob(&key))
@@ -370,6 +383,17 @@ impl LxmfStorage for StorageHandle {
     ) -> Result<(), StorageError> {
         let encoded = encoded.to_vec();
         self.call(move |s| s.insert_inbound_message(id, at, &encoded))
+    }
+    fn contains_inbound_message(&self, message_id: &[u8; 32]) -> Result<bool, StorageError> {
+        let id = *message_id;
+        self.call(move |s| s.contains_inbound_message(&id))
+    }
+    fn replace_peers(&mut self, peers: &[([u8; 16], Vec<u8>)]) -> Result<(), StorageError> {
+        let peers = peers.to_vec();
+        self.call(move |s| s.replace_peers(&peers))
+    }
+    fn peer_page(&self, limit: usize) -> Result<Vec<([u8; 16], Vec<u8>)>, StorageError> {
+        self.call(move |s| s.peer_page(limit))
     }
 }
 

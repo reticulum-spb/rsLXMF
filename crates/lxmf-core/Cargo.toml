@@ -29,7 +29,7 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 rusqlite = { workspace = true, optional = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 proptest = { workspace = true }
