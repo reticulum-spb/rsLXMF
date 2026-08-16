@@ -797,8 +797,9 @@ fn secure_database_files(path: &Path) -> Result<(), StorageError> {
         path.with_extension("sqlite-shm"),
     ] {
         if candidate.exists() {
-            std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
-                .map_err(StorageError::Io)?;
+            // FAT derives permissions from mount options and may reject chmod. Keeping this
+            // hardening best-effort allows SQLite migrations to run on such filesystems.
+            let _ = std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600));
         }
     }
     Ok(())
