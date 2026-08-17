@@ -6,9 +6,16 @@ edition.workspace = true
 license.workspace = true
 autobins = false
 
+[features]
+default = ["sqlite-bundled", "reticulum-full"]
+sqlite = ["lxmf-core/sqlite"]
+sqlite-bundled = ["lxmf-core/sqlite-bundled"]
+reticulum-full = ["lxmf-core/reticulum-full", "rns-runtime/full", "rns-runtime/serial"]
+reticulum-client = ["lxmf-core/reticulum-client", "rns-runtime/client"]
+
 [dependencies]
 lxmf-core = { workspace = true }
-rns-runtime = { workspace = true, features = ["serial"] }
+rns-runtime = { workspace = true }
 rns-identity = { workspace = true }
 rns-transport = { workspace = true }
 rns-wire = { workspace = true }

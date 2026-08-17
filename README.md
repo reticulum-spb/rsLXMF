@@ -120,6 +120,29 @@ cargo build --release
 After the build, use the commands below with `./target/release/lxmd-rs` on
 macOS/Linux or `.\target\release\lxmd-rs.exe` on Windows.
 
+### Reticulum runtime variants
+
+The default build uses the complete Reticulum runtime, including serial
+interfaces:
+
+```bash
+cargo build --release -p lxmf-tools \
+  --no-default-features \
+  --features sqlite-bundled,reticulum-full
+```
+
+The client-only variant can only attach to an already-running shared
+Reticulum instance. It does not start a shared server, fall back to standalone
+mode, or compile physical interface implementations:
+
+```bash
+cargo build --release -p lxmf-tools \
+  --no-default-features \
+  --features sqlite-bundled,reticulum-client
+```
+
+`reticulum-full` and `reticulum-client` are mutually exclusive.
+
 ## Rust Examples
 
 The [`examples`](examples/README.md) workspace crate ports the reference

@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["reticulum-full"]
+reticulum-full = ["lxmf-core/reticulum-full", "rns-runtime/full"]
+reticulum-client = ["lxmf-core/reticulum-client", "rns-runtime/client"]
+
 [dependencies]
 lxmf-core = { workspace = true }
 rns-crypto = { workspace = true }

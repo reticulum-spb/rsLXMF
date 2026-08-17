@@ -35,6 +35,12 @@
 
 #![allow(deprecated)]
 
+#[cfg(all(feature = "reticulum-full", feature = "reticulum-client"))]
+compile_error!("features `reticulum-full` and `reticulum-client` are mutually exclusive");
+
+#[cfg(not(any(feature = "reticulum-full", feature = "reticulum-client")))]
+compile_error!("enable either `reticulum-full` or `reticulum-client`");
+
 /// Unix time as f64 seconds — Python `time.time()` equivalent.
 pub(crate) fn now_f64() -> f64 {
     std::time::SystemTime::now()

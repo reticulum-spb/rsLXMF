@@ -6,9 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["sqlite-bundled"]
+default = ["sqlite-bundled", "reticulum-full"]
 sqlite = ["dep:rusqlite"]
 sqlite-bundled = ["sqlite", "rusqlite/bundled"]
+reticulum-full = ["rns-runtime/full"]
+reticulum-client = ["rns-runtime/client"]
 
 [dependencies]
 base64 = { workspace = true }
