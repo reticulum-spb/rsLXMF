@@ -256,8 +256,10 @@ the handler is started. A non-zero handler exit status is logged.
 
 ## Configuration
 
-`lxmd-rs --config <dir>` expects a directory and reads `<dir>/config`.
+`lxmd-rs --config <dir>` expects a directory and reads `<dir>/config.yaml`.
 `lxmd-rs --rnsconfig <dir>` expects a Reticulum config directory.
+The old ConfigObj/INI file named `config` is not read or converted. See
+[`CONFIG.md`](CONFIG.md) for the complete schema, defaults and constraints.
 
 The daemon keeps all durable runtime state in
 `<config-dir>/storage/lxmf/lxmf.sqlite`. It does not create parallel message,
@@ -269,8 +271,8 @@ If no LXMF config directory is supplied, the default is:
 
 | Platform | Default LXMF config file |
 | --- | --- |
-| Linux/macOS | `/etc/rsLXMF/config`, then `~/.config/rsLXMF/config`, then `~/.rsLXMF/config` |
-| Windows | `%APPDATA%\rsLXMF\config` |
+| Linux/macOS | `/etc/rsLXMF/config.yaml`, then `~/.config/rsLXMF/config.yaml`, then `~/.rsLXMF/config.yaml` |
+| Windows | `%APPDATA%\rsLXMF\config.yaml` |
 
 
 If `--rnsconfig` is omitted, Reticulum config resolution follows
@@ -280,9 +282,9 @@ Recommended standalone locations:
 
 | Environment | LXMF config | Reticulum config |
 | --- | --- | --- |
-| macOS/Linux desktop | `~/.rsLXMF/config` | `~/.rsReticulum/config` |
-| Windows desktop | `%APPDATA%\rsLXMF\config` | `%APPDATA%\rsReticulum\config` |
-| Linux service | `/var/lib/rsLXMF/config` | `/etc/rsReticulum/config` or another explicit Reticulum directory |
+| macOS/Linux desktop | `~/.rsLXMF/config.yaml` | `~/.rsReticulum/config.yaml` |
+| Windows desktop | `%APPDATA%\rsLXMF\config.yaml` | `%APPDATA%\rsReticulum\config.yaml` |
+| Linux service | `/var/lib/rsLXMF/config.yaml` | `/etc/rsReticulum/config.yaml` or another explicit Reticulum directory |
 
 Use existing LXMF or Reticulum directories, such as `~/.lxmd`, `~/.lxmf`, or
 `~/.reticulum`, only by passing them explicitly. That keeps the default install
@@ -290,51 +292,15 @@ isolated while still allowing deliberate drop-in and migration tests.
 
 Minimal config:
 
-```ini
-[lxmf]
-display_name = Rat
-announce_at_start = no
-delivery_transfer_max_accepted_size = 1000
-# stamp_cost = 8
-# on_inbound = /path/to/handler
+```yaml
+lxmf:
+  display_name: Rat
 
-[propagation]
-enable_node = no
-announce_at_start = yes
-autopeer = yes
-autopeer_maxdepth = 6
-auth_required = no
-# node_name = Rat Nest
-# static_peers = e17f833c4ddf8890dd3a79a6fea8161d
-# outbound_node = e17f833c4ddf8890dd3a79a6fea8161d
-# max_peers = 20
-# propagation_stamp_cost_target = 16
-# propagation_stamp_cost_flexibility = 3
-
-[storage]
-# Absolute, or relative to the LXMF config directory:
-# database_path = storage/lxmf/lxmf.sqlite
-# SQLite page cache budget in KiB:
-page_cache_size = 1024
-# Passive WAL checkpoint and bounded incremental vacuum.
-vacuum_interval = 3600
-vacuum_pages = 128
-
-[logging]
-loglevel = 4
+propagation:
+  enable_node: false
 ```
 
-Supported sections:
-
-| Section | Keys |
-| --- | --- |
-| `[lxmf]` | `display_name`, `announce_at_start`, `announce_interval`, `delivery_transfer_max_accepted_size`, `stamp_cost`, `on_inbound` |
-| `[propagation]` | `enable_node`, `node_name`, `auth_required`, `announce_at_start`, `announce_interval`, `autopeer`, `autopeer_maxdepth`, `message_storage_limit`, `propagation_message_max_accepted_size`, `propagation_sync_max_accepted_size`, `propagation_stamp_cost_target`, `propagation_stamp_cost_flexibility`, `peering_cost`, `remote_peering_cost_max`, `max_peers`, `static_peers`, `prioritise_destinations`, `control_allowed`, `from_static_only`, `outbound_node`, `propagation_stamp_cost`, `propagation_limit`, `enforce_stamps` |
-| `[storage]` | `database_path` (absolute or relative to the LXMF config directory), `page_cache_size` (KiB, 64–65536), `vacuum_interval` (seconds, minimum 60), `vacuum_pages` (maximum pages reclaimed per pass) |
-| `[control]` | `auth_required`, `allowed` |
-| `[logging]` | `loglevel` |
-
-Optional hash-list files live next to `<config-dir>/config`:
+Optional hash-list files live next to `<config-dir>/config.yaml`:
 
 | File | Meaning |
 | --- | --- |
