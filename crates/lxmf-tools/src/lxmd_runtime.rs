@@ -173,13 +173,13 @@ fn default_lxmd_config_dir() -> PathBuf {
     }
 
     let etc = PathBuf::from("/etc/rsLXMF");
-    if etc.join("config").is_file() {
+    if etc.join(crate::config::CONFIG_FILE_NAME).is_file() {
         return etc;
     }
 
     if let Ok(home) = std::env::var("HOME") {
         let xdg = PathBuf::from(&home).join(".config/rsLXMF");
-        if xdg.join("config").is_file() {
+        if xdg.join(crate::config::CONFIG_FILE_NAME).is_file() {
             return xdg;
         }
         PathBuf::from(home).join(".rsLXMF")

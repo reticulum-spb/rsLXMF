@@ -100,29 +100,13 @@ fn ctrl_c_exits_during_startup_announce_wait() {
     let lxmf_dir = TestDir::new("lxmf-ctrlc");
     let rns_dir = TestDir::new("rns-ctrlc");
     fs::write(
-        lxmf_dir.path().join("config"),
-        "\
-[lxmf]
-display_name = Test
-announce_at_start = yes
-
-[propagation]
-enable_node = no
-",
+        lxmf_dir.path().join("config.yaml"),
+        "lxmf:\n  display_name: Test\n  announce_at_start: true\n",
     )
     .expect("write LXMF config");
     fs::write(
-        rns_dir.path().join("config"),
-        "\
-[reticulum]
-share_instance = No
-enable_transport = No
-respond_to_probes = No
-panic_on_interface_error = No
-discover_interfaces = No
-
-[interfaces]
-",
+        rns_dir.path().join("config.yaml"),
+        "reticulum:\n  share_instance: false\ninterfaces: []\n",
     )
     .expect("write no-interface Reticulum config");
 
@@ -224,17 +208,16 @@ fn example_config_exits_before_runtime_initialisation() {
         combined_output(&output)
     );
     let text = stdout(&output);
-    assert!(text.contains("[lxmf]"));
-    assert!(text.contains("display_name = Anonymous Peer"));
-    assert!(text.contains("announce_at_start = no"));
-    assert!(text.contains("delivery_transfer_max_accepted_size = 1000"));
-    assert!(text.contains("[propagation]"));
-    assert!(text.contains("enable_node = no"));
-    assert!(text.contains("announce_interval = 360"));
-    assert!(text.contains("announce_at_start = yes"));
-    assert!(text.contains("[logging]"));
-    assert!(text.contains("loglevel = 4"));
-    assert!(!text.contains("[control]"));
+    assert!(text.contains("lxmf:"));
+    assert!(text.contains("display_name: Anonymous Peer"));
+    assert!(text.contains("announce_at_start: false"));
+    assert!(text.contains("delivery_transfer_max_accepted_size: 1000"));
+    assert!(text.contains("propagation:"));
+    assert!(text.contains("enable_node: false"));
+    assert!(text.contains("announce_interval: 360"));
+    assert!(text.contains("announce_at_start: true"));
+    assert!(text.contains("logging:"));
+    assert!(text.contains("level: 4"));
     assert!(
         stderr(&output).is_empty(),
         "--exampleconfig should return before logging/runtime startup"
@@ -251,7 +234,7 @@ fn send_method_values_parse_without_network_runtime() {
             "expected send method {mode:?} to parse, got:\n{}",
             combined_output(&output)
         );
-        assert!(stdout(&output).contains("[lxmf]"));
+        assert!(stdout(&output).contains("lxmf:"));
         assert!(stderr(&output).is_empty());
     }
 }
@@ -290,17 +273,8 @@ fn status_and_peers_query_control_and_timeout_without_daemon() {
     let rns_dir = TestDir::new("rns");
     write_rust_identity(&lxmf_dir.path().join("identity"));
     fs::write(
-        rns_dir.path().join("config"),
-        "\
-[reticulum]
-share_instance = No
-enable_transport = No
-respond_to_probes = No
-panic_on_interface_error = No
-discover_interfaces = No
-
-[interfaces]
-",
+        rns_dir.path().join("config.yaml"),
+        "reticulum:\n  share_instance: false\ninterfaces: []\n",
     )
     .expect("write no-interface Reticulum config");
 
@@ -337,10 +311,9 @@ discover_interfaces = No
     );
 
     let logs = combined_output(&output);
-    assert!(
-        logs.contains("Using default configuration"),
-        "missing LXMF config should fall back to defaults, got logs:\n{logs}"
-    );
+    let generated = fs::read_to_string(lxmf_dir.path().join("config.yaml"))
+        .expect("missing LXMF config should create config.yaml");
+    assert_eq!(generated, "{}\n");
     assert!(
         logs.contains("interfaces=0"),
         "test config should avoid live Reticulum interfaces, got logs:\n{logs}"
@@ -352,13 +325,8 @@ fn control_status_rejects_missing_identity_before_runtime() {
     let lxmf_dir = TestDir::new("lxmf-missing-identity");
     let rns_dir = TestDir::new("rns-missing-identity");
     fs::write(
-        rns_dir.path().join("config"),
-        "\
-[reticulum]
-share_instance = No
-
-[interfaces]
-",
+        rns_dir.path().join("config.yaml"),
+        "reticulum:\n  share_instance: false\ninterfaces: []\n",
     )
     .expect("write no-interface Reticulum config");
 
@@ -395,13 +363,8 @@ fn control_preflight_invalid_hashes_exit_203() {
     let rns_dir = TestDir::new("rns-invalid-control");
     write_rust_identity(&lxmf_dir.path().join("identity"));
     fs::write(
-        rns_dir.path().join("config"),
-        "\
-[reticulum]
-share_instance = No
-
-[interfaces]
-",
+        rns_dir.path().join("config.yaml"),
+        "reticulum:\n  share_instance: false\ninterfaces: []\n",
     )
     .expect("write no-interface Reticulum config");
 

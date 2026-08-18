@@ -163,78 +163,7 @@ pub fn parse_destination_hash(raw: &str) -> Result<[u8; 16], String> {
 }
 
 pub fn example_config() -> &'static str {
-    r#"# This is an example LXM Daemon config file.
-[propagation]
-
-enable_node = no
-
-# control_allowed = 7d7e542829b40f32364499b27438dba8, 437229f8e29598b2282b88bad5e44698
-
-# node_name = Anonymous Propagation Node
-
-announce_interval = 360
-
-announce_at_start = yes
-
-autopeer = yes
-
-autopeer_maxdepth = 6
-
-# message_storage_limit = 500
-
-# propagation_message_max_accepted_size = 256
-
-# propagation_sync_max_accepted_size = 10240
-
-# propagation_stamp_cost_target = 16
-
-# propagation_stamp_cost_flexibility = 3
-
-# peering_cost = 18
-
-# remote_peering_cost_max = 26
-
-# max_peers = 20
-
-# static_peers = e17f833c4ddf8890dd3a79a6fea8161d, 5a2d0029b6e5ec87020abaea0d746da4
-
-# prioritise_destinations = 4a594a8cced4a8f6adf23a8ac67b4011
-
-# from_static_only = True
-
-auth_required = no
-
-
-[storage]
-
-# Absolute path, or a path relative to the LXMF config directory.
-# database_path = storage/lxmf/lxmf.sqlite
-
-# SQLite page cache budget in KiB (clamped to 64..65536).
-page_cache_size = 1024
-
-# SQLite maintenance period in seconds (minimum 60) and maximum pages reclaimed per pass.
-vacuum_interval = 3600
-vacuum_pages = 128
-
-
-[lxmf]
-
-display_name = Anonymous Peer
-
-announce_at_start = no
-
-# announce_interval = 360
-
-delivery_transfer_max_accepted_size = 1000
-
-# on_inbound = /path/to/handler
-
-
-[logging]
-
-loglevel = 4
-"#
+    crate::config::EXAMPLE_CONFIG
 }
 
 /// Parse a plaintext destination-hash list: one 16-byte hex value per line.

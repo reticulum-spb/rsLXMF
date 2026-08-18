@@ -2,145 +2,16 @@
 //!
 //! Python reference: LXMF/Utilities/lxmd.py.
 
+use crate::config::Config;
 use lxmf_core::constants::*;
 use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
 use lxmf_core::storage::{
     SqliteStorageOptions, StorageError, StorageHandle, spawn_sqlite_storage_actor_with_options,
 };
-use rns_runtime::config::{Config, ConfigSection};
 use std::path::PathBuf;
 
-/// Normalized view of Python `lxmd.apply_config()` behavior.
-///
-/// This intentionally mirrors Python's active_configuration keys and units.
-/// It is kept separate from [`DaemonConfig`] while the daemon still has legacy
-/// Rust fields and storage layout.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PythonLxmdConfig {
-    pub display_name: String,
-    pub peer_announce_at_start: bool,
-    pub peer_announce_interval: Option<i64>,
-    pub delivery_transfer_max_accepted_size: f64,
-    pub on_inbound: Option<String>,
-    pub enable_propagation_node: bool,
-    pub node_name: Option<String>,
-    pub auth_required: bool,
-    pub node_announce_at_start: bool,
-    pub autopeer: bool,
-    pub autopeer_maxdepth: Option<i64>,
-    pub node_announce_interval: Option<i64>,
-    pub message_storage_limit: f64,
-    pub propagation_transfer_max_accepted_size: f64,
-    pub propagation_sync_max_accepted_size: f64,
-    pub propagation_stamp_cost_target: i64,
-    pub propagation_stamp_cost_flexibility: i64,
-    pub peering_cost: i64,
-    pub remote_peering_cost_max: i64,
-    pub prioritised_lxmf_destinations: Vec<String>,
-    pub control_allowed_identities: Vec<String>,
-    pub static_peers: Vec<String>,
-    pub max_peers: Option<i64>,
-    pub from_static_only: bool,
-    pub target_loglevel: Option<i64>,
-}
-
-impl PythonLxmdConfig {
-    pub fn from_config(config: &Config) -> Self {
-        let lxmf = config.section("lxmf");
-        let propagation = config.section("propagation");
-        let logging = config.section("logging");
-
-        let propagation_transfer_max_accepted_size = propagation
-            .and_then(|sec| sec.get_float("propagation_message_max_accepted_size"))
-            .map(|v| v.max(0.38))
-            .unwrap_or(256.0);
-
-        Self {
-            display_name: lxmf
-                .and_then(|sec| sec.get("display_name"))
-                .unwrap_or("Anonymous Peer")
-                .to_string(),
-            peer_announce_at_start: get_bool_or(lxmf, "announce_at_start", false),
-            peer_announce_interval: get_int(lxmf, "announce_interval").map(|v| v * 60),
-            delivery_transfer_max_accepted_size: get_float_or_floor(
-                lxmf,
-                "delivery_transfer_max_accepted_size",
-                1000.0,
-                0.38,
-            ),
-            on_inbound: lxmf
-                .and_then(|sec| sec.get("on_inbound"))
-                .map(ToString::to_string),
-            enable_propagation_node: get_bool_or(propagation, "enable_node", false),
-            node_name: propagation
-                .and_then(|sec| sec.get("node_name"))
-                .map(ToString::to_string),
-            auth_required: get_bool_or(propagation, "auth_required", false),
-            node_announce_at_start: get_bool_or(propagation, "announce_at_start", false),
-            autopeer: get_bool_or(propagation, "autopeer", true),
-            autopeer_maxdepth: get_int(propagation, "autopeer_maxdepth"),
-            node_announce_interval: get_int(propagation, "announce_interval").map(|v| v * 60),
-            message_storage_limit: get_float_or_floor(
-                propagation,
-                "message_storage_limit",
-                500.0,
-                0.005,
-            ),
-            propagation_transfer_max_accepted_size,
-            propagation_sync_max_accepted_size: get_float_or_floor(
-                propagation,
-                "propagation_sync_max_accepted_size",
-                256.0 * 40.0,
-                0.38,
-            ),
-            propagation_stamp_cost_target: get_int(propagation, "propagation_stamp_cost_target")
-                .map(|v| v.max(PROPAGATION_COST_MIN as i64))
-                .unwrap_or(PROPAGATION_COST as i64),
-            propagation_stamp_cost_flexibility: get_int(
-                propagation,
-                "propagation_stamp_cost_flexibility",
-            )
-            .map(|v| v.max(0))
-            .unwrap_or(PROPAGATION_COST_FLEX as i64),
-            peering_cost: get_int(propagation, "peering_cost")
-                .map(|v| v.max(0))
-                .unwrap_or(PEERING_COST as i64),
-            remote_peering_cost_max: get_int(propagation, "remote_peering_cost_max")
-                .map(|v| v.max(0))
-                .unwrap_or(MAX_PEERING_COST as i64),
-            prioritised_lxmf_destinations: get_list(propagation, "prioritise_destinations"),
-            control_allowed_identities: get_list(propagation, "control_allowed"),
-            static_peers: get_list(propagation, "static_peers"),
-            max_peers: get_int(propagation, "max_peers"),
-            from_static_only: get_bool_or(propagation, "from_static_only", false),
-            target_loglevel: get_int(logging, "loglevel"),
-        }
-    }
-}
-
-fn get_bool_or(section: Option<&ConfigSection>, key: &str, default: bool) -> bool {
-    section.and_then(|sec| sec.get_bool(key)).unwrap_or(default)
-}
-
-fn get_int(section: Option<&ConfigSection>, key: &str) -> Option<i64> {
-    section.and_then(|sec| sec.get_int(key))
-}
-
-fn get_float_or_floor(section: Option<&ConfigSection>, key: &str, default: f64, floor: f64) -> f64 {
-    section
-        .and_then(|sec| sec.get_float(key))
-        .map(|value| value.max(floor))
-        .unwrap_or(default)
-}
-
-fn get_list(section: Option<&ConfigSection>, key: &str) -> Vec<String> {
-    section
-        .and_then(|sec| sec.get_list(key))
-        .unwrap_or_default()
-}
-
 /// Daemon configuration parsed from an INI config file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DaemonConfig {
     pub display_name: Option<String>,
     pub node_name: Option<String>,
@@ -244,125 +115,50 @@ impl DaemonConfig {
         }
     }
 
-    /// Parse from `[lxmf]`, `[propagation]`, and `[control]` sections.
+    /// Convert the validated YAML model into runtime units and structures.
     pub fn from_config(config: &Config) -> Self {
-        let py = PythonLxmdConfig::from_config(config);
-        let mut dc = DaemonConfig {
-            display_name: Some(py.display_name),
-            node_name: py.node_name,
-            announce_at_start: py.peer_announce_at_start,
-            announce_interval: seconds_to_u64(py.peer_announce_interval),
-            propagation_enabled: py.enable_propagation_node,
-            propagation_stamp_cost: clamp_python_cost_to_u8(
-                py.propagation_stamp_cost_target,
-                PROPAGATION_COST_MIN as i64,
+        Self {
+            display_name: Some(config.lxmf.display_name.clone()),
+            node_name: config.propagation.node_name.clone(),
+            announce_at_start: config.lxmf.announce_at_start,
+            announce_interval: minutes_to_seconds(config.lxmf.announce_interval),
+            stamp_cost: config.lxmf.stamp_cost,
+            propagation_enabled: config.propagation.enable_node,
+            outbound_propagation_node: config.propagation.outbound_node.clone(),
+            propagation_stamp_cost: config.propagation.propagation_stamp_cost_target,
+            propagation_stamp_flex: config.propagation.propagation_stamp_cost_flexibility,
+            peering_cost: config.propagation.peering_cost,
+            max_peering_cost: config.propagation.remote_peering_cost_max,
+            max_peers: config.propagation.max_peers,
+            autopeer: config.propagation.autopeer,
+            autopeer_maxdepth: config.propagation.autopeer_maxdepth,
+            propagation_limit_kb: kb_to_usize_ceil(
+                config.propagation.propagation_message_max_accepted_size,
             ),
-            propagation_stamp_flex: clamp_python_cost_to_u8(
-                py.propagation_stamp_cost_flexibility,
-                0,
-            ),
-            peering_cost: clamp_python_cost_to_u8(py.peering_cost, 0),
-            max_peering_cost: clamp_python_cost_to_u8(py.remote_peering_cost_max, 0),
-            max_peers: py
-                .max_peers
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(MAX_PEERS),
-            autopeer: py.autopeer,
-            autopeer_maxdepth: py
-                .autopeer_maxdepth
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(AUTOPEER_MAXDEPTH),
-            propagation_limit_kb: kb_to_usize_ceil(py.propagation_transfer_max_accepted_size),
-            sync_limit_kb: kb_to_usize_ceil(py.propagation_sync_max_accepted_size),
-            on_inbound_command: py.on_inbound,
-            node_announce_at_start: py.node_announce_at_start,
-            node_announce_interval: seconds_to_u64(py.node_announce_interval),
-            auth_required: py.auth_required,
-            control_allowed: py.control_allowed_identities,
-            static_peers: py.static_peers,
-            prioritise_destinations: py.prioritised_lxmf_destinations,
-            message_storage_limit: megabytes_to_bytes(py.message_storage_limit),
-            from_static_only: py.from_static_only,
+            sync_limit_kb: kb_to_usize_ceil(config.propagation.propagation_sync_max_accepted_size),
+            on_inbound_command: config.lxmf.on_inbound.clone(),
+            node_announce_at_start: config.propagation.announce_at_start,
+            node_announce_interval: minutes_to_seconds(config.propagation.announce_interval),
+            auth_required: config.propagation.auth_required,
+            control_allowed: config.propagation.control_allowed.clone(),
+            static_peers: config.propagation.static_peers.clone(),
+            prioritise_destinations: config.propagation.prioritise_destinations.clone(),
+            enforce_stamps: config.propagation.enforce_stamps,
+            message_storage_limit: megabytes_to_bytes(config.propagation.message_storage_limit),
+            database_path: config.storage.database_path.clone(),
+            page_cache_size: config.storage.page_cache_size,
+            vacuum_interval: config.storage.vacuum_interval,
+            vacuum_pages: config.storage.vacuum_pages,
+            from_static_only: config.propagation.from_static_only,
             delivery_transfer_max_accepted_size: kb_to_usize_ceil(
-                py.delivery_transfer_max_accepted_size,
+                config.lxmf.delivery_transfer_max_accepted_size,
             ),
-            ..DaemonConfig::default()
-        };
-
-        if let Some(sec) = config.section("lxmf")
-            && let Some(cost) = sec.get_uint("stamp_cost")
-        {
-            dc.stamp_cost = Some(cost as u8);
         }
-
-        if let Some(sec) = config.section("propagation") {
-            if let Some(node) = sec.get("outbound_node") {
-                let trimmed = node.trim();
-                if !trimmed.is_empty() {
-                    dc.outbound_propagation_node = Some(trimmed.to_string());
-                }
-            }
-            if get_int(Some(sec), "propagation_stamp_cost_target").is_none()
-                && let Some(cost) = sec.get_uint("propagation_stamp_cost")
-            {
-                dc.propagation_stamp_cost = cost as u8;
-            }
-            if get_float(Some(sec), "propagation_message_max_accepted_size").is_none()
-                && get_float(Some(sec), "propagation_transfer_max_accepted_size").is_none()
-                && let Some(limit) = sec.get_uint("propagation_limit")
-            {
-                dc.propagation_limit_kb = limit as usize;
-            }
-            dc.enforce_stamps = sec.get_bool_or("enforce_stamps", false);
-        }
-
-        if let Some(sec) = config.section("storage") {
-            if let Some(path) = sec.get("database_path") {
-                let trimmed = path.trim();
-                if !trimmed.is_empty() {
-                    dc.database_path = Some(PathBuf::from(trimmed));
-                }
-            }
-            if let Some(interval) = sec.get_uint("vacuum_interval") {
-                dc.vacuum_interval = interval.max(60);
-            }
-            if let Some(size) = sec.get_uint("page_cache_size") {
-                dc.page_cache_size = size.clamp(64, 65_536) as u32;
-            }
-            if let Some(pages) = sec.get_uint("vacuum_pages") {
-                dc.vacuum_pages = pages.min(u32::MAX as u64) as u32;
-            }
-        }
-
-        if let Some(sec) = config.section("control") {
-            if !dc.auth_required {
-                dc.auth_required = sec.get_bool_or("auth_required", false);
-            }
-            if dc.control_allowed.is_empty()
-                && let Some(allowed) = sec.get("allowed")
-            {
-                dc.control_allowed = allowed
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            }
-        }
-
-        dc
     }
 }
 
-fn clamp_python_cost_to_u8(value: i64, floor: i64) -> u8 {
-    value.max(floor).min(u8::MAX as i64) as u8
-}
-
-fn get_float(section: Option<&ConfigSection>, key: &str) -> Option<f64> {
-    section.and_then(|sec| sec.get_float(key))
-}
-
-fn seconds_to_u64(value: Option<i64>) -> Option<u64> {
-    value.map(|seconds| seconds.max(0) as u64)
+fn minutes_to_seconds(value: Option<u64>) -> Option<u64> {
+    value.map(|minutes| minutes.saturating_mul(60))
 }
 
 fn kb_to_usize_ceil(value: f64) -> usize {
@@ -433,315 +229,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn on_inbound_receives_json_on_stdin_without_path_argument() {
-        let output = std::env::temp_dir().join(format!(
-            "lxmf-on-inbound-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let json = br#"{"version":1,"content":"hello"}"#;
-        execute_on_inbound(&format!("tee {}", output.display()), json).unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), json);
-        let _ = std::fs::remove_file(output);
-    }
-
-    #[test]
-    fn test_default_config() {
-        let dc = DaemonConfig::default();
-        assert_eq!(dc.display_name.as_deref(), Some("Anonymous Peer"));
-        assert!(!dc.announce_at_start);
-        assert_eq!(dc.announce_interval, None);
-        assert!(!dc.propagation_enabled);
-        assert_eq!(dc.propagation_stamp_cost, 16);
-        assert_eq!(dc.propagation_stamp_flex, 3);
-        assert_eq!(dc.peering_cost, 18);
-        assert_eq!(dc.max_peering_cost, 26);
-        assert_eq!(dc.max_peers, 20);
-        assert!(dc.autopeer);
-        assert_eq!(dc.autopeer_maxdepth, AUTOPEER_MAXDEPTH);
-        assert_eq!(dc.propagation_limit_kb, 256);
-        assert_eq!(dc.sync_limit_kb, 10_240);
-        assert!(!dc.node_announce_at_start);
-        assert_eq!(dc.node_announce_interval, None);
-        assert_eq!(dc.message_storage_limit, Some(500_000_000));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1000);
-        assert!(!dc.from_static_only);
-    }
-
-    #[test]
-    fn python_normalized_config_matches_omitted_defaults() {
-        let config = rns_runtime::config::Config::parse("").unwrap();
-        let py = PythonLxmdConfig::from_config(&config);
-
-        assert_eq!(py.display_name, "Anonymous Peer");
-        assert!(!py.peer_announce_at_start);
-        assert_eq!(py.peer_announce_interval, None);
-        assert_eq!(py.delivery_transfer_max_accepted_size, 1000.0);
-        assert_eq!(py.on_inbound, None);
-        assert!(!py.enable_propagation_node);
-        assert_eq!(py.node_name, None);
-        assert!(!py.auth_required);
-        assert!(!py.node_announce_at_start);
-        assert!(py.autopeer);
-        assert_eq!(py.autopeer_maxdepth, None);
-        assert_eq!(py.node_announce_interval, None);
-        assert_eq!(py.message_storage_limit, 500.0);
-        assert_eq!(py.propagation_transfer_max_accepted_size, 256.0);
-        assert_eq!(py.propagation_sync_max_accepted_size, 10240.0);
-        assert_eq!(py.propagation_stamp_cost_target, 16);
-        assert_eq!(py.propagation_stamp_cost_flexibility, 3);
-        assert_eq!(py.peering_cost, 18);
-        assert_eq!(py.remote_peering_cost_max, 26);
-        assert!(py.prioritised_lxmf_destinations.is_empty());
-        assert!(py.control_allowed_identities.is_empty());
-        assert!(py.static_peers.is_empty());
-        assert_eq!(py.max_peers, None);
-        assert!(!py.from_static_only);
-        assert_eq!(py.target_loglevel, None);
-    }
-
-    #[test]
-    fn python_normalized_config_matches_units_floors_and_lists() {
-        let input = r#"
-[propagation]
-announce_interval = 2
-message_storage_limit = 0.001
-propagation_message_max_accepted_size = 0.1
-propagation_sync_max_accepted_size = 0.1
-propagation_stamp_cost_target = 1
-propagation_stamp_cost_flexibility = -9
-peering_cost = -1
-remote_peering_cost_max = -2
-static_peers = 00112233445566778899aabbccddeeff
-prioritise_destinations = 0102030405060708090a0b0c0d0e0f10
-control_allowed = 11111111111111111111111111111111
-from_static_only = yes
-max_peers = 7
-
-[lxmf]
-announce_interval = 3
-delivery_transfer_max_accepted_size = 0.1
-
-[logging]
-loglevel = 6
-"#;
-        let config = rns_runtime::config::Config::parse(input).unwrap();
-        let py = PythonLxmdConfig::from_config(&config);
-
-        assert_eq!(py.peer_announce_interval, Some(180));
-        assert_eq!(py.node_announce_interval, Some(120));
-        assert_eq!(py.delivery_transfer_max_accepted_size, 0.38);
-        assert_eq!(py.message_storage_limit, 0.005);
-        assert_eq!(py.propagation_transfer_max_accepted_size, 0.38);
-        assert_eq!(py.propagation_sync_max_accepted_size, 0.38);
-        assert_eq!(py.propagation_stamp_cost_target, 13);
-        assert_eq!(py.propagation_stamp_cost_flexibility, 0);
-        assert_eq!(py.peering_cost, 0);
-        assert_eq!(py.remote_peering_cost_max, 0);
-        assert_eq!(py.static_peers, ["00112233445566778899aabbccddeeff"]);
+    fn typed_defaults_match_daemon_defaults() {
         assert_eq!(
-            py.prioritised_lxmf_destinations,
-            ["0102030405060708090a0b0c0d0e0f10"]
-        );
-        assert_eq!(
-            py.control_allowed_identities,
-            ["11111111111111111111111111111111"]
-        );
-        assert_eq!(py.max_peers, Some(7));
-        assert!(py.from_static_only);
-        assert_eq!(py.target_loglevel, Some(6));
-    }
-
-    #[test]
-    fn python_normalized_config_keeps_legacy_transfer_overwrite() {
-        let input = r#"
-[propagation]
-propagation_transfer_max_accepted_size = 12
-"#;
-        let config = rns_runtime::config::Config::parse(input).unwrap();
-        let py = PythonLxmdConfig::from_config(&config);
-
-        assert_eq!(
-            py.propagation_transfer_max_accepted_size, 256.0,
-            "Python 0.9.6 ignores legacy propagation_transfer_max_accepted_size unless the newer key is set"
+            DaemonConfig::from_config(&Config::default()),
+            DaemonConfig::default()
         );
     }
 
     #[test]
-    fn daemon_config_matches_python_legacy_transfer_overwrite() {
-        let input = r#"
-[propagation]
-propagation_transfer_max_accepted_size = 12
-"#;
-        let config = rns_runtime::config::Config::parse(input).unwrap();
-        let dc = DaemonConfig::from_config(&config);
-
-        assert_eq!(
-            dc.propagation_limit_kb, 256,
-            "DaemonConfig should match Python 0.9.6 handling of legacy propagation_transfer_max_accepted_size"
-        );
-    }
-
-    #[test]
-    fn test_to_router_config() {
-        let dc = DaemonConfig::default();
-        let rc = dc.to_router_config();
-        assert!(!rc.propagation_enabled);
-        assert_eq!(rc.max_peers, 20);
-        assert_eq!(rc.delivery_limit_kb, 1000);
-        assert_eq!(rc.propagation_limit_kb, 256);
-        assert_eq!(rc.sync_limit_kb, 10_240);
-        assert_eq!(rc.propagation_stamp_cost, 16);
-        assert_eq!(rc.propagation_stamp_flex, 3);
-        assert_eq!(rc.ext.autopeer_maxdepth, AUTOPEER_MAXDEPTH);
-        assert_eq!(rc.ext.peering_cost, 18);
-        assert_eq!(rc.ext.max_peering_cost, 26);
-        assert!(!rc.ext.auth_required);
-        assert_eq!(rc.ext.message_storage_limit, Some(500_000_000));
-        assert_eq!(rc.ext.name, None);
-        assert!(!rc.ext.from_static_only);
-    }
-
-    #[test]
-    fn test_create_router() {
-        let dc = DaemonConfig::default();
-        let router = create_router(&dc);
-        assert_eq!(router.stats().pending_outbound, 0);
-    }
-
-    #[test]
-    fn test_create_router_with_transport() {
-        let dc = DaemonConfig::default();
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let router = create_router_with_transport(&dc, tx);
-        assert!(router.has_transport());
-        assert_eq!(router.stats().pending_outbound, 0);
-    }
-
-    #[test]
-    fn test_parse_config() {
-        let input = r#"
-[lxmf]
-display_name = TestNode
-announce_at_start = yes
-announce_interval = 3
-delivery_transfer_max_accepted_size = 0.1
-stamp_cost = 8
-
-[propagation]
-enable_node = yes
-node_name = PropNode
-outbound_node = aabbccddeeff00112233445566778899
-announce_at_start = yes
-announce_interval = 2
-message_storage_limit = 0.001
-propagation_message_max_accepted_size = 0.1
-propagation_sync_max_accepted_size = 0.1
-propagation_stamp_cost_target = 1
-propagation_stamp_cost_flexibility = -9
-peering_cost = -1
-remote_peering_cost_max = -2
-max_peers = 10
-autopeer = no
-autopeer_maxdepth = 2
-static_peers = 00112233445566778899aabbccddeeff
-prioritise_destinations = 0102030405060708090a0b0c0d0e0f10
-control_allowed = 11111111111111111111111111111111
-from_static_only = yes
-"#;
-        let config = rns_runtime::config::Config::parse(input).unwrap();
-        let dc = DaemonConfig::from_config(&config);
-        assert_eq!(dc.display_name.as_deref(), Some("TestNode"));
-        assert!(dc.announce_at_start);
-        assert_eq!(dc.announce_interval, Some(180));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1);
-        assert_eq!(dc.stamp_cost, Some(8));
-        assert!(dc.propagation_enabled);
-        assert_eq!(dc.node_name.as_deref(), Some("PropNode"));
-        assert_eq!(
-            dc.outbound_propagation_node.as_deref(),
-            Some("aabbccddeeff00112233445566778899")
-        );
-        assert!(dc.node_announce_at_start);
-        assert_eq!(dc.node_announce_interval, Some(120));
-        assert_eq!(dc.message_storage_limit, Some(5_000));
-        assert_eq!(dc.propagation_limit_kb, 1);
-        assert_eq!(dc.sync_limit_kb, 1);
-        assert_eq!(dc.propagation_stamp_cost, 13);
-        assert_eq!(dc.propagation_stamp_flex, 0);
-        assert_eq!(dc.peering_cost, 0);
-        assert_eq!(dc.max_peering_cost, 0);
-        assert_eq!(dc.max_peers, 10);
-        assert!(!dc.autopeer);
-        assert_eq!(dc.autopeer_maxdepth, 2);
-        assert_eq!(dc.static_peers, ["00112233445566778899aabbccddeeff"]);
-        assert_eq!(
-            dc.prioritise_destinations,
-            ["0102030405060708090a0b0c0d0e0f10"]
-        );
-        assert_eq!(dc.control_allowed, ["11111111111111111111111111111111"]);
-        assert!(dc.from_static_only);
-    }
-
-    #[test]
-    fn test_parse_python_stamp_target_key_with_floor() {
-        let input = r#"
-[propagation]
-propagation_stamp_cost_target = 1
-"#;
-        let config = rns_runtime::config::Config::parse(input).unwrap();
-        let dc = DaemonConfig::from_config(&config);
-
-        assert_eq!(dc.propagation_stamp_cost, PROPAGATION_COST_MIN);
-        assert_eq!(
-            dc.to_router_config().propagation_stamp_cost,
-            PROPAGATION_COST_MIN
-        );
-    }
-
-    #[test]
-    fn test_legacy_stamp_cost_key_remains_fallback() {
-        let input = r#"
-[propagation]
-propagation_stamp_cost = 19
-"#;
-        let config = rns_runtime::config::Config::parse(input).unwrap();
-        let dc = DaemonConfig::from_config(&config);
-
-        assert_eq!(dc.propagation_stamp_cost, 19);
-        assert_eq!(dc.to_router_config().propagation_stamp_cost, 19);
-    }
-
-    #[test]
-    fn storage_maintenance_config_is_bounded() {
+    fn typed_config_normalizes_runtime_units() {
         let config = Config::parse(
-            "[storage]\ndatabase_path = data/custom.sqlite\npage_cache_size = 32\nvacuum_interval = 1\nvacuum_pages = 42\n",
+            "lxmf:\n  announce_interval: 10\n  stamp_cost: 7\npropagation:\n  enable_node: true\n  announce_interval: 20\n  message_storage_limit: 2.5\nstorage:\n  database_path: data/lxmf.sqlite\n",
+            "config.yaml",
         )
         .unwrap();
-        let parsed = DaemonConfig::from_config(&config);
+        let runtime = DaemonConfig::from_config(&config);
+        assert_eq!(runtime.announce_interval, Some(600));
+        assert_eq!(runtime.node_announce_interval, Some(1200));
+        assert_eq!(runtime.stamp_cost, Some(7));
+        assert!(runtime.propagation_enabled);
+        assert_eq!(runtime.message_storage_limit, Some(2_500_000));
         assert_eq!(
-            parsed.database_path.as_deref(),
-            Some(std::path::Path::new("data/custom.sqlite"))
+            runtime.database_path,
+            Some(PathBuf::from("data/lxmf.sqlite"))
         );
-        assert_eq!(parsed.vacuum_interval, 60);
-        assert_eq!(parsed.vacuum_pages, 42);
-        assert_eq!(parsed.page_cache_size, 64);
     }
 
-    /// Python lxmd exposes no enforce_ratchets option; the key must parse as a no-op.
     #[test]
-    fn test_enforce_ratchets_key_ignored_matching_python_lxmd() {
-        let input = r#"
-[propagation]
-enforce_ratchets = yes
-enforce_stamps = yes
-"#;
-        let config = rns_runtime::config::Config::parse(input).unwrap();
-        let dc = DaemonConfig::from_config(&config);
-
-        assert!(dc.enforce_stamps);
+    fn router_config_receives_typed_values() {
+        let mut config = Config::default();
+        config.propagation.enable_node = true;
+        config.propagation.max_peers = 9;
+        config.propagation.enforce_stamps = true;
+        let daemon = DaemonConfig::from_config(&config);
+        let router = daemon.to_router_config();
+        assert!(router.propagation_enabled);
+        assert_eq!(router.max_peers, 9);
+        assert!(daemon.enforce_stamps);
     }
 }

@@ -1,5 +1,6 @@
 //! LXMF Tools: shared library code for lxmd and LXMF CLI utilities.
 
+pub mod config;
 pub mod daemon;
 pub mod lxmd_cli;
 pub mod lxmd_control;

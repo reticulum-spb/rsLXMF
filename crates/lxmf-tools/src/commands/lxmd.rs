@@ -26,6 +26,7 @@ use lxmf_core::router::{
     DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState, DirectRouteSnapshot,
     LxmRouter, OutboundAction, plan_direct_delivery,
 };
+use lxmf_tools::config::{CONFIG_FILE_NAME, Config};
 use lxmf_tools::daemon::{DaemonConfig, create_router_with_sqlite, execute_on_inbound};
 use lxmf_tools::lxmd_cli::{
     Args, example_config, load_hash_list, normalize_hash_hex, parse_destination_hash,
@@ -64,11 +65,18 @@ enum ControlCommand {
     Unpeer([u8; 16]),
 }
 
-fn setup_logging(verbose: u8, quiet: u8, service: bool) {
+fn setup_logging(verbose: u8, quiet: u8, service: bool, configured_level: i32) {
     let level = match (verbose, quiet) {
         (v, _) if v >= 3 => tracing::Level::TRACE,
         (2, _) => tracing::Level::DEBUG,
         (1, _) => tracing::Level::INFO,
+        (0, 0) if configured_level != 4 => match configured_level {
+            0 | 1 => tracing::Level::ERROR,
+            2 => tracing::Level::WARN,
+            3 | 4 => tracing::Level::INFO,
+            5 | 6 => tracing::Level::DEBUG,
+            _ => tracing::Level::TRACE,
+        },
         (0, 0) => {
             if service {
                 tracing::Level::WARN
@@ -2633,8 +2641,6 @@ pub(crate) async fn main() {
         return;
     }
 
-    setup_logging(args.verbose, args.quiet, args.service);
-
     let (config_dir, rns_config_dir) =
         resolve_config_dirs(args.config.as_deref(), args.rnsconfig.as_deref());
 
@@ -2662,20 +2668,30 @@ pub(crate) async fn main() {
         None
     };
 
-    let config_path = config_dir.join("config");
-    let config = match rns_runtime::config::Config::from_file(&config_path) {
+    let config_path = config_dir.join(CONFIG_FILE_NAME);
+    let config = match Config::from_file(&config_path) {
         Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                "Could not load config from {}: {}",
-                config_path.display(),
-                e
-            );
-            tracing::info!("Using default configuration");
-            rns_runtime::config::Config::parse(rns_runtime::config::Config::default_config())
-                .expect("default config must parse")
+        Err(lxmf_tools::config::ConfigError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            let config = Config::default();
+            if let Err(error) = std::fs::create_dir_all(&config_dir).and_then(|_| {
+                config
+                    .to_yaml()
+                    .map_err(std::io::Error::other)
+                    .and_then(|yaml| std::fs::write(&config_path, yaml))
+            }) {
+                eprintln!("Could not create {}: {}", config_path.display(), error);
+                return;
+            }
+            config
+        }
+        Err(error) => {
+            eprintln!("Could not load {}: {}", config_path.display(), error);
+            return;
         }
     };
+    setup_logging(args.verbose, args.quiet, args.service, config.logging.level);
 
     let mut daemon_config = DaemonConfig::from_config(&config);
     if args.propagation_node {

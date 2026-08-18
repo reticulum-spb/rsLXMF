@@ -385,12 +385,9 @@ mod tests {
         for dir in [&shared_dir, &server_dir, &client_dir] {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(
-                dir.join("config"),
+                dir.join("config.yaml"),
                 format!(
-                    "[reticulum]\nshare_instance = Yes\nshared_instance_type = tcp\n\
-                     shared_instance_port = {port}\ninstance_control_port = {control_port}\n\
-                     rpc_key = 4242424242424242424242424242424242424242424242424242424242424242\n\
-                     enable_transport = No\n\n[interfaces]\n"
+                    "reticulum:\n  share_instance: true\n  shared_instance_type: tcp\n  shared_instance_port: {port}\n  instance_control_port: {control_port}\n  rpc_key: 4242424242424242424242424242424242424242424242424242424242424242\n  enable_transport: false\ninterfaces: []\n"
                 ),
             )
             .unwrap();
