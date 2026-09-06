@@ -244,6 +244,7 @@ fn now() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "reticulum-full")]
     use rns_runtime::reticulum::InstanceMode;
 
     #[test]
@@ -255,6 +256,7 @@ mod tests {
         assert!(parse_destination_hash("11").is_err());
     }
 
+    #[cfg(feature = "reticulum-full")]
     async fn free_tcp_port_pair() -> (u16, u16) {
         let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -264,6 +266,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "reticulum-full")]
     #[tokio::test]
     async fn sender_and_receiver_exchange_signed_resource_over_shared_instance() {
         let (port, control_port) = free_tcp_port_pair().await;

@@ -322,24 +322,6 @@ fn decode_binary_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
-
-    use rns_identity::destination::Destination;
-    use rns_identity::identity::Identity;
-    use rns_runtime::lifecycle::ShutdownSignal;
-    use rns_runtime::link_manager::LinkManager;
-    use rns_runtime::reticulum::{InstanceMode, init};
-
-    async fn free_tcp_port_pair() -> (u16, u16) {
-        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        (
-            first.local_addr().unwrap().port(),
-            second.local_addr().unwrap().port(),
-        )
-    }
-
     #[test]
     fn binary_array_filters_invalid_ids() {
         let encoded = crate::encode_value(&rmpv::Value::Array(vec![
@@ -371,8 +353,29 @@ mod tests {
         assert_eq!(client.received_count(), 0);
     }
 
+    // This fixture starts the shared daemon itself; strict clients must not
+    // create a daemon when their endpoint is unavailable.
+    #[cfg(feature = "reticulum-full")]
     #[tokio::test]
     async fn propagation_download_and_peer_sync_cross_shared_instance() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        use rns_identity::destination::Destination;
+        use rns_identity::identity::Identity;
+        use rns_runtime::lifecycle::ShutdownSignal;
+        use rns_runtime::link_manager::LinkManager;
+        use rns_runtime::reticulum::{InstanceMode, init};
+
+        async fn free_tcp_port_pair() -> (u16, u16) {
+            let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            (
+                first.local_addr().unwrap().port(),
+                second.local_addr().unwrap().port(),
+            )
+        }
+
         let (port, control_port) = free_tcp_port_pair().await;
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

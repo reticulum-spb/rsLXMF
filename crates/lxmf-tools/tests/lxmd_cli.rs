@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(all(unix, feature = "reticulum-full"))]
 use std::process::{Child, Stdio};
 use std::process::{Command, Output};
-#[cfg(unix)]
+#[cfg(all(unix, feature = "reticulum-full"))]
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,7 +59,7 @@ fn write_rust_identity(path: &Path) {
         .expect("write Rust identity");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "reticulum-full"))]
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -94,7 +94,7 @@ fn help_lists_cli_surface_without_starting_runtime() {
     assert!(text.contains("[possible values: opportunistic, direct, propagated]"));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "reticulum-full"))]
 #[test]
 fn ctrl_c_exits_during_startup_announce_wait() {
     let lxmf_dir = TestDir::new("lxmf-ctrlc");
@@ -267,6 +267,7 @@ fn clap_requires_send_argument() {
     assert!(stderr(&output).contains("a value is required for '--send <DEST_HASH> <CONTENT>'"));
 }
 
+#[cfg(feature = "reticulum-full")]
 #[test]
 fn status_and_peers_query_control_and_timeout_without_daemon() {
     let lxmf_dir = TestDir::new("lxmf");
