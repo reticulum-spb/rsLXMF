@@ -2626,7 +2626,7 @@ impl LxmdRunner {
             destination_hash: trunc_hash,
             context: rns_wire::context::PacketContext::None,
         };
-        let mut proof_raw = proof_header.pack();
+        let mut proof_raw = proof_header.pack().ok()?;
         proof_raw.extend_from_slice(&signature);
         Some(proof_raw)
     }
